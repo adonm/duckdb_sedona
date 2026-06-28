@@ -3,12 +3,13 @@
 Status of the `sedonadb` DuckDB extension against the Apache SedonaDB and
 PostGIS spatial surfaces, and what it takes to reach a **superset**.
 
-## Where we are now (~115 functions, all on the `geo`/`wkb` stack)
+## Where we are now (~130 functions, all on the `geo`/`wkb` stack)
 
 Constructors & I/O (incl. EWKT **and EWKB**) · accessors · DE-9IM predicates ·
-measurements (incl. `ST_MaxDistance`/`ST_LongestLine`/`ST_ShortestLine`) ·
-boolean set ops · affine/simplify/segmentize transforms · `ST_MakeValid`
-robustness · three aggregates (`ST_Collect`, `ST_Envelope` agg, `ST_Union` agg)
+measurements (incl. `ST_MaxDistance`/`ST_LongestLine`/`ST_ShortestLine`/
+`ST_MinimumClearance`/`MinimumClearanceLine`) · boolean set ops ·
+affine/simplify/segmentize transforms · `ST_MakeValid` robustness · four
+aggregates (`ST_Collect`, `ST_Envelope` agg, `ST_Union` agg, `ST_MakeLine` agg)
 · `ST_DWithin` · bbox accessors (join prefilter) · a custom robust
 point-in-polygon · **geodesic/geography**
 (`ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere`) · EWKT/EWKB/SRID
@@ -17,9 +18,12 @@ ClosestPoint/Hausdorff/FlipCoordinates/Reverse/RemoveRepeatedPoints/\
 OrientedEnvelope` · `ST_Affine`(6-param)/`ST_Segmentize`/`ST_LineSubstring`/
 `ST_LineMerge`/`ST_CollectionExtract`/`ST_ForceCollection`/`ST_Multi`/
 `ST_Normalize`/`ST_ForceRHR`/`ST_ForcePolygonCW`/`ST_ForcePolygonCCW`/
-`ST_TriangulatePolygon`/`ST_OrderingEquals`/`ST_NRings`. Verified end-to-end in
-DuckDB 1.5.4 over a local DuckLake and Apache SpatialBench
-(`benchmarks/BENCHMARKS.md`).
+`ST_TriangulatePolygon`/`ST_OrderingEquals`/`ST_NRings` ·
+`ST_MakeEnvelope`/`ST_MakePolygon`/`ST_RemovePoint`/`ST_AddPoint`/
+`ST_SimplifyPreserveTopology`/`ST_MinimumBoundingCircle`/`ST_GeneratePoints`/
+`ST_IsValidReason` · **`ST_Dump`/`ST_DumpPoints`/`ST_DumpSegments`** set-returning
+table functions. Verified end-to-end in DuckDB 1.5.4 over a local DuckLake and
+Apache SpatialBench (`benchmarks/BENCHMARKS.md`).
 
 ## Previously-flagged hard bits — now resolved
 
@@ -55,7 +59,7 @@ Legend: ✅ shipped · 🟡 partial · ⏳ not yet · ➖ out of scope (niche).
 | Editing (`Translate/Scale/Rotate/Flip/Reverse/Affine/Segmentize/LineSubstring/LineMerge/Normalize`) | ✅ | ✅ | ✅ | all done incl. 6-param `ST_Affine` |
 | Geometry processing (`Buffer/Simplify/ConvexHull/ConcaveHull/OrientedEnvelope/Triangulate/Voronoi`) | ✅ | 🟡 | 🟡 | Buffer/Simplify/Hull/OrientedEnvelope/TriangulatePolygon done; bounded Voronoi polygons + Polygonize open |
 | Linear referencing (`LineInterpolatePoint/Locate/Substring`) | ✅ | 🟡 | ✅ | interpolate/locate/substring all done |
-| Aggregates (`Collect/Union/Envelope/Intersection`) | ✅ | ✅ | 🟡 | `ST_Collect`/`ST_Union`/`ST_Envelope` agg done; intersection aggregate open |
+| Aggregates (`Collect/Union/Envelope/Intersection/MakeLine`) | ✅ | ✅ | ✅ | `ST_Collect`/`ST_Union`/`ST_Envelope`/`ST_MakeLine` agg done; intersection aggregate open |
 | **Geography (geodesic) ops** | ✅ | ✅ | ✅ | `Distance/DWithin/Length/Area` Sphere done (lon/lat) |
 | **CRS / PROJ (`ST_Transform`, SRID)** | ✅ | ✅ | ✅ | `ST_Transform` via PROJ (runtime libproj dep) |
 | **Spatial index join (R-tree/GiST, `&&`/`<->`)** | ✅ | ✅ | ✅ | `sedona_join` table fn (R-tree over spilled parquet) + bbox-prefilter |
@@ -84,8 +88,11 @@ Cheap wins; each is one `register_*!` line + a `geo` call. **Mostly ✅ done.**
 - ✅ More aggregates: `ST_Union` agg (`st_union_agg`), `ST_Envelope` agg.
   `ST_Collect` already done. Intersection aggregate still open.
 - ✅ `ST_TriangulatePolygon` (Delaunay-interior approximation).
-- ⏳ `ST_Dump`, `ST_DumpPoints`, `ST_DumpSegments` — needs a **table/set
-  function**; the one new FFI shape we haven't built.
+- ✅ `ST_Dump`, `ST_DumpPoints`, `ST_DumpSegments` — set-returning table
+  functions (`src/dump.rs`); the previously- unbuilt FFI shape is now wired up.
+- ✅ `ST_MakeEnvelope`, `ST_MakePolygon`, `ST_RemovePoint`/`ST_AddPoint`,
+  `ST_SimplifyPreserveTopology`, `ST_MinimumClearance`/`...Line`,
+  `ST_MinimumBoundingCircle` (Welzl), `ST_GeneratePoints`, `ST_IsValidReason`.
 - ⏳ `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea` — topology editing.
 - ⏳ `ST_VoronoiPolygons` (bounded cell polygons; `ST_VoronoiLines` already
   ships).
@@ -93,8 +100,9 @@ Cheap wins; each is one `register_*!` line + a `geo` call. **Mostly ✅ done.**
 ### Tier 1b — PostGIS geo-backed geometry processing
 ✅ `ST_HausdorffDistance`, `ST_FrechetDistance`, `ST_MaxDistance`,
 `ST_LongestLine`, `ST_ClosestPoint`, `ST_ShortestLine`, `ST_Project`,
-`ST_OrientedEnvelope`, `ST_TriangulatePolygon` all shipped. Still open:
-`ST_MinimumClearance`, `ST_GeneratePoints`, `ST_Subdivide`.
+`ST_OrientedEnvelope`, `ST_TriangulatePolygon`, `ST_MinimumClearance`/`...Line`,
+`ST_MinimumBoundingCircle`, `ST_GeneratePoints` all shipped. Still open:
+`ST_Subdivide`.
 
 ### Tier 2 — Geography (geodesic) — ✅ DONE
 `ST_DistanceSphere`, `ST_DWithinSphere`, `ST_LengthSphere`, `ST_AreaSphere`

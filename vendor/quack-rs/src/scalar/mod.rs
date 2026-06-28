@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2026 Tom F. <https://github.com/tomtom215/>
+// My way of giving something small back to the open source community
+// and encouraging more Rust development!
+
+//! Builder for registering `DuckDB` scalar functions.
+//!
+//! Scalar functions process one data chunk at a time and return a single value
+//! per row. They are the most common type of function in `DuckDB` extensions.
+//!
+//! Both [`ScalarFunctionBuilder`] and [`ScalarFunctionSetBuilder`] support:
+//! - Simple parameter types via `param(TypeId)`
+//! - Complex parameterized types via `param_logical(LogicalType)` (e.g.,
+//!   `LIST(BIGINT)`, `MAP(VARCHAR, INTEGER)`, `STRUCT(...)`)
+//! - Complex return types via `returns_logical(LogicalType)`
+//! - Per-function NULL handling via `null_handling(NullHandling)`
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use quack_rs::scalar::ScalarFunctionBuilder;
+//! use quack_rs::types::TypeId;
+//! use libduckdb_sys::{duckdb_connection, duckdb_function_info, duckdb_data_chunk,
+//!                     duckdb_vector};
+//!
+//! unsafe extern "C" fn my_func(
+//!     _info: duckdb_function_info,
+//!     _input: duckdb_data_chunk,
+//!     _output: duckdb_vector,
+//! ) {}
+//!
+//! // fn register(con: duckdb_connection) -> Result<(), quack_rs::error::ExtensionError> {
+//! //     unsafe {
+//! //         ScalarFunctionBuilder::new("double_it")
+//! //             .param(TypeId::BigInt)
+//! //             .returns(TypeId::BigInt)
+//! //             .function(my_func)
+//! //             .register(con)
+//! //     }
+//! // }
+//! ```
+
+pub mod builder;
+pub mod info;
+
+pub use builder::{ScalarFunctionBuilder, ScalarFunctionSetBuilder, ScalarOverloadBuilder};
+pub use info::ScalarFunctionInfo;
+#[cfg(feature = "duckdb-1-5")]
+pub use info::{ScalarBindInfo, ScalarInitInfo};

@@ -1,0 +1,188 @@
+[package]
+name = "quack-rs"
+version = "0.14.0"
+edition = "2021"
+rust-version = "1.87.0"
+authors = ["Tom F. <tomf@tomtomtech.net>"]
+description = "Production-grade Rust SDK for building DuckDB loadable extensions"
+license = "MIT"
+repository = "https://github.com/tomtom215/quack-rs"
+homepage = "https://quack-rs.com"
+documentation = "https://docs.rs/quack-rs"
+readme = "README.md"
+keywords = ["duckdb", "extension", "ffi", "sql", "analytics"]
+categories = ["database", "api-bindings", "development-tools::ffi"]
+autobenches = false
+exclude = [
+    "docs/",
+    "examples/",
+    ".github/",
+    "book/",
+    "book.toml",
+    "assets/",
+    "deny.toml",
+    "AUDIT.md",
+    "RELEASING.md",
+    "LESSONS.md",
+    "clippy.toml",
+    "codecov.yml",
+    "mutants.toml",
+    "rust-toolchain.toml",
+]
+
+[lib]
+name = "quack_rs"
+crate-type = ["rlib"]
+
+[features]
+
+## Enables the `testing::InMemoryDb` helper — a real in-memory DuckDB database
+## for SQL-level integration tests — by **compiling DuckDB from C++ source**
+## (the `duckdb` crate's `bundled` feature). No env vars required; cold builds
+## take ~5-10 min. This is the safe, reproducible default for SQL-level tests.
+##
+## Prefer `bundled-test-prebuilt` to link a pre-built libduckdb instead (faster,
+## no C++ compile). The two are mutually exclusive in intent; if both are
+## enabled, the source (`bundled`) build wins.
+##
+## Enabling this feature also initialises the `loadable-extension` dispatch
+## table from the linked DuckDB symbols, so `InMemoryDb::open()` works in
+## `cargo test` even though no DuckDB host process loads the extension.
+##
+## # Important: architectural limitation
+##
+## Even with this feature, quack-rs's own wrappers (`VectorReader`, `VectorWriter`,
+## `Connection::register_*`) still route through the `loadable-extension` dispatch
+## table and cannot be called in `cargo test`. Use `InMemoryDb` for SQL-level
+## assertions (e.g. verifying SQL macro output) and `MockVectorWriter` /
+## `MockVectorReader` for callback logic tests.
+##
+## # Usage in your extension
+##
+## ```toml
+## [dev-dependencies]
+## quack-rs = { version = "0.14", features = ["bundled-test"] }
+## ```
+bundled-test = ["_duckdb-testing", "duckdb/bundled"]
+
+## Same capability as `bundled-test`, but links a **pre-built libduckdb** rather
+## than compiling DuckDB from C++ source — much faster, at the cost of supplying
+## the library yourself via exactly one of:
+##   - `DUCKDB_DOWNLOAD_LIB=1` — `libduckdb-sys` downloads the upstream DuckDB
+##     release zip (~40 MB, cached under `target/`). Recommended.
+##   - `DUCKDB_LIB_DIR=/path/to/libduckdb` — link a libduckdb tree you already
+##     have (also set `DUCKDB_INCLUDE_DIR` if `duckdb.hpp` isn't beside the lib).
+##
+## Requires `libduckdb-sys >= 1.10503` (which publishes the header directory via
+## `DEP_DUCKDB_INCLUDE`); older versions need `DUCKDB_INCLUDE_DIR` set explicitly.
+##
+## ```toml
+## [dev-dependencies]
+## quack-rs = { version = "0.14", features = ["bundled-test-prebuilt"] }
+## ```
+bundled-test-prebuilt = ["_duckdb-testing"]
+
+## Internal implementation detail — **do not enable directly.** Activates the
+## optional `duckdb` dependency and gates the `InMemoryDb` helper and its tests.
+## Enabled transitively by `bundled-test` (source build) and
+## `bundled-test-prebuilt` (pre-built libduckdb); those two differ only in
+## whether `duckdb/bundled` is also turned on.
+_duckdb-testing = ["dep:duckdb"]
+## Enables wrappers for DuckDB 1.5.0 C API additions (e.g. scalar function local
+## states, config option registration). Requires `libduckdb-sys >= 1.5.0` to be
+## resolved by Cargo. Has no effect when compiled against libduckdb-sys 1.4.x.
+##
+## Requires `libduckdb-sys >= 1.10500.0` (DuckDB 1.5.0+) to be resolved by Cargo.
+## Enables wrappers for new C Extension API surfaces:
+## - `TypeId::TimeNs` column type
+## - `TypeId::Any`, `TypeId::Varint`, `TypeId::SqlNull`, `TypeId::IntegerLiteral`, `TypeId::StringLiteral` column types
+## - Scalar function bind/init lifecycle and local state
+## - Scalar function varargs and volatile flags
+## - Config option registration (extension-defined settings)
+## - Copy function support (custom `COPY TO` handlers)
+## - Catalog entry lookup (incl. `Catalog::type_name`)
+## - Client context access (file system, config, catalog)
+## - Table description metadata (column count, names, types)
+## - Structured error data + UTF-8 validation (`ErrorData`, `DuckDbErrorType`, `check_valid_utf8`)
+## - Bound expression inspection / constant folding (`Expression`, `ScalarBindInfo::argument`)
+## - Virtual file system access (`FileSystem`, `FileHandle`, `FileOpenOptions`)
+## - Bulk row appender (`Appender`)
+## - Zero-copy selection vectors (`SelectionVector`)
+## - Database instance cache (`InstanceCache`)
+## - `Value::display_string` and `TIME_NS` accessors (`Value::time_ns` / `as_time_ns`)
+duckdb-1-5 = []
+
+## Enables wrappers layered on top of `duckdb-1-5` that require DuckDB **1.5.3+**.
+## Implies (and re-enables) `duckdb-1-5`.
+##
+## Requires `libduckdb-sys >= 1.10503.1` (DuckDB 1.5.3) to be resolved by Cargo:
+## the gated items reference C type-enum constants that do not exist in
+## libduckdb-sys 1.5.0–1.5.2, so enabling this feature against an older binding
+## is a compile error (by design — it surfaces the version mismatch immediately).
+## This is the same soft-contract style as `duckdb-1-5` (which targets 1.5.0).
+##
+## Gates:
+## - `TypeId::Variant` (`DUCKDB_TYPE_VARIANT`, 41) — added to the C type enum in
+##   DuckDB 1.5.3.
+## - `TypeId::Geometry` (`DUCKDB_TYPE_GEOMETRY`, 40) — present earlier in the
+##   1.5.x line, but gated here at the 1.5.3 floor so one feature covers both new
+##   type-enum values behind a single, verifiable version requirement.
+duckdb-1-5-3 = ["duckdb-1-5"]
+
+[dependencies]
+libduckdb-sys = { version = ">=1.4.4, <2", features = ["loadable-extension"] }
+duckdb = { version = ">=1.4.4, <2", optional = true }
+mutants = "0.0.4"
+
+[build-dependencies]
+# Used only when `bundled-test` / `bundled-test-prebuilt` is active: compiles the
+# thin C++ shim that calls DuckDB's internal CreateAPIv1() to initialise the
+# loadable-extension dispatch table from the linked DuckDB symbols.
+cc = "1"
+
+[dev-dependencies]
+# `duckdb` is intentionally NOT a dev-dependency: it is an optional regular
+# dependency activated only by `bundled-test` / `bundled-test-prebuilt`, so that
+# a plain `cargo test` (and every downstream consumer's lockfile) stays free of
+# the DuckDB + arrow tree.
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+# tempfile is version-pinned for reproducible dev builds. It was originally held
+# back to avoid getrandom >=0.4 (edition2024 / Rust >=1.85) when MSRV was 1.84.1;
+# now that MSRV is 1.87.0 that constraint no longer applies, but the pin is kept
+# to avoid unrelated dev-dependency churn. proptest only needs `tempfile ^3`.
+tempfile = "=3.27.0"
+
+[[bench]]
+name = "interval_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allow common SDK API patterns that trigger noisy false-positives
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+return_self_not_must_use = "allow"
+
+[package.metadata.docs.rs]
+# Render the full API on docs.rs — including the `duckdb-1-5` / `duckdb-1-5-3`
+# feature-gated modules and `TypeId` variants — so the documentation (and the
+# README's docs.rs links) resolve. Without this, docs.rs builds the empty default
+# feature set and every feature-gated item would be missing. `bundled-test` is
+# intentionally excluded (it compiles DuckDB from source).
+features = ["duckdb-1-5-3"]

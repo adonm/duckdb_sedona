@@ -85,11 +85,13 @@ dispatch + declarative macro registry, low-maintenance single-line registration
 
 All functions take **BLOB** (ISO WKB) arguments. Geometry-returning functions
 return **BLOB** (ISO WKB). `NULL` in → `NULL` out; an input that fails to parse
-or an operation that is undefined for the input also yields `NULL`. **~115
+or an operation that is undefined for the input also yields `NULL`. **~130
 functions** across constructors, accessors, predicates, measurements, set ops,
-transforms, validity, three aggregates (`st_collect`, `st_envelope_agg`,
-`st_union_agg`), **geodesic/geography** (`st_distancesphere`…), EWKT/EWKB/SRID,
-affine & segmentize transforms, line editing, and I/O.
+transforms, validity, four aggregates (`st_collect`, `st_envelope_agg`,
+`st_union_agg`, `st_makeline_agg`), **geodesic/geography**
+(`st_distancesphere`…), EWKT/EWKB/SRID, affine & segmentize transforms, line
+editing, a set-returning `ST_Dump` family (`st_dump`/`st_dumppoints`/
+`st_dumpsegments`), and I/O.
 
 See **[ROADMAP.md](./ROADMAP.md)** for a category-level capability matrix vs
 SedonaDB and PostGIS and the tiered plan to reach a superset (next up:
@@ -141,6 +143,16 @@ a DuckDB-chunk ⇄ Arrow bridge to the real SedonaDB DataFusion UDFs).
 | `st_shortestline` | `(BLOB, BLOB) → BLOB` | line realizing min distance |
 | `st_orderingequals` | `(BLOB, BLOB) → BOOLEAN` | structural (coord-order) equality |
 | `st_union_agg` | `(BLOB) → BLOB` (aggregate) | cascaded polygonal union |
+| `st_makeline_agg` | `(BLOB) → BLOB` (aggregate) | points → LineString |
+| `st_makeenvelope` | `(DOUBLE×4) → BLOB` | bbox → Polygon |
+| `st_makepolygon` | `(BLOB) → BLOB` | closed LineString → Polygon |
+| `st_removepoint` / `st_addpoint` | `(BLOB, INT)` / `(BLOB, BLOB)` | line editing |
+| `st_simplifypreservetopology` | `(BLOB, DOUBLE) → BLOB` | RDP with validity fallback |
+| `st_minimumclearance` / `...line` | `(BLOB) → DOUBLE` / `BLOB` | vertex-move clearance |
+| `st_minimumboundingcircle` | `(BLOB, DOUBLE) → BLOB` | Welzl min enclosing circle |
+| `st_generatepoints` | `(BLOB, INTEGER) → BLOB` | seeded random points in polygon |
+| `st_isvalidreason` | `(BLOB) → VARCHAR` | structural validity report |
+| `st_dump` / `st_dumppoints` / `st_dumpsegments` | `(BLOB)` → table | set-returning dump (path, geom) |
 
 ### Adding a function
 
@@ -177,6 +189,7 @@ symbols at load time. The produced shared object exports the entry-point symbol
 | Dependency | When | What it enables | Notes |
 |------------|------|-----------------|-------|
 | DuckDB 1.5.x | runtime host | loadable-extension host | ABI is 1.5.4 (`libduckdb-sys 1.10504.0`); built with the `loadable-extension` feature |
+| **`quack-rs`** | build (statically linked) | DuckDB C-API SDK; **vendored + patched** | upstream's `VectorReader::read_blob` validated UTF-8 and dropped binary WKB bytes (the README's original bug); the vendored copy fixes `read_blob` at the source and adds `Value::as_blob` for table-function bind params. See [vendor/quack-rs/PATCHES.md](./vendor/quack-rs/PATCHES.md). |
 | **PROJ (`libproj`)** | **build**: bundled & **statically linked** (`proj-sys/bundled_proj` + `libsqlite3-sys/bundled`) | `ST_Transform` (CRS reprojection) | Our own PROJ is **static** → `ST_Transform` has **no runtime dep** of its own. (But GDAL, below, brings its own dynamic libproj.) |
 | **GDAL (`libgdal` ≥ 3.13)** | **build (`pkg-config gdal` + `LIBCLANG_PATH` for bindgen) + runtime (`LD_LIBRARY_PATH`)** | **Raster** (`st_raster_info`, `st_raster_stats`, …) via a **vendored + patched** `gdal` 0.19 crate (only the high-level `gdal` crate is vendored; `gdal-sys` comes unpatched from crates.io — see `vendor/gdal/PATCHES.md`). | `LOAD` needs `libgdal.so` (and its transitive `libproj`/`libsqlite3`) resolvable. |
 | arrow / parquet (Rust crates) | build only (statically linked) | `sedona_join` (R-tree spatial join over spilled parquet) | no runtime dep |
@@ -228,10 +241,12 @@ SELECT st_distance(st_geomfromtext('POINT(0 0)'), st_geomfromtext('POINT(3 4)'))
 
 > **Bug found while wiring up SQL tests.** ~half of all geometries came back
 > `NULL` because the upstream `quack-rs` blob reader validates UTF-8 and returns
-> empty for non-UTF-8 bytes — and WKB is arbitrary binary (e.g. coordinate
-> `1.0` encodes an `0xF0` byte that breaks UTF-8). sedonadb reads the raw
-> `duckdb_string_t` bytes itself (`src/dispatch.rs`, `BlobCol`), so binary WKB
-> round-trips correctly. Unit tests in `src/functions.rs` pin this.
+> empty for non-UTF-8 bytes — and WKB is arbitrary binary (e.g. a coordinate
+> `1.0` encodes an `0xF0` byte that breaks UTF-8). **Fixed at the source:** we
+> [vendor `quack-rs`](./vendor/quack-rs/PATCHES.md) and made
+> `VectorReader::read_blob` binary-safe, so the dispatch layer reads WKB blobs
+> directly with no work-around. Unit tests in `src/functions.rs` and the
+> vendored crate pin this.
 
 In practice you feed it any `BLOB` column containing ISO-WKB (e.g. a
 SpatialBench parquet geometry column, or DuckDB `spatial`'s `GEOMETRY` storage).
@@ -257,6 +272,30 @@ COPY (SELECT id, geom FROM b) TO 'b.parquet';
 SELECT * FROM sedona_join('a.parquet', 'b.parquet', 'intersects');  -- (a_row, b_row)
 -- predicates: intersects | contains | within | covers | disjoint | equals
 --              touches | crosses | overlaps | dwithin
+```
+
+## Set-returning dump (`ST_Dump` family)
+
+The one FFI shape the extension was missing — set-returning table functions.
+`ST_Dump` explodes a collection into its atomic geometries; `ST_DumpPoints`
+yields one `POINT` per vertex; `ST_DumpSegments` yields one `LINESTRING` per
+edge. Each carries a PostGIS-style `{path}` (`{1}`, `{1,2}`, …) so you can
+navigate back to the source.
+
+```sql
+-- One row per point of a multipoint, with navigation paths.
+SELECT path, st_astext(geom) FROM st_dump(st_geomfromtext('MULTIPOINT(1 2,3 4)'));
+--  path | st_astext
+-- ------+-----------
+--  {1}  | POINT(1 2)
+--  {2}  | POINT(3 4)
+
+-- Explode a column: DuckDB evaluates the table function per row (lateral).
+SELECT t.id, d.path, st_astext(d.geom)
+FROM   my_table t, st_dumppoints(t.geom) d;
+
+-- Vertices of a polygon ring (exterior = ring 1, holes 2..n).
+SELECT path, npt FROM st_dumppoints(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))'));
 ```
 
 ## Test
@@ -296,10 +335,16 @@ brute-force cross joins are the documented bottleneck).
 src/
   lib.rs        — extension entry point (entry_point! macro → register_all)
   registry.rs   — THE CATALOG: declarative macro matrix, one line per function
-  dispatch.rs   — generic vectorized executors + ST_Collect aggregate state
-  geometry.rs   — WKB ⇄ geo_types::Geometry (ported from Apache SedonaDB)
+  dispatch.rs   — generic vectorized executors + aggregate state machines
+  geometry.rs   — WKB ⇄ geo_types::Geometry (ported from Apache SedonaDB; EWKB-tolerant)
   functions.rs  — geo-crate-backed ST_* implementations
+  dump.rs       — ST_Dump / ST_DumpPoints / ST_DumpSegments table functions
+  spatial_join.rs — sedona_join (R-tree spatial join over spilled parquet)
+  raster.rs     — st_raster_info / st_raster_stats (vendored GDAL)
   bin/package.rs— appends the 512-byte DuckDB metadata trailer (.duckdb_extension)
+vendor/
+  quack-rs/     — vendored SDK (binary-safe read_blob + Value::as_blob; see PATCHES.md)
+  gdal/         — vendored GDAL crate patched for libgdal 3.13
 benchmarks/
   setup_lake.sql, spatialbench_lake.sql, spatialbench_full.sql, run_queries.sh, run.sh
 ```
@@ -310,7 +355,7 @@ What the brief's "Future work" section asked for, and where it stands:
 
 | Item | Status |
 | --- | --- |
-| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — ~115 functions now, incl. DE-9IM predicates, transforms, affine/segmentize/line editing, `ST_TriangulatePolygon`, `ST_Collect`/`ST_Union`/`ST_Envelope` aggregates |
+| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — ~130 functions now, incl. DE-9IM predicates, transforms, affine/segmentize/line editing, `ST_TriangulatePolygon`, `ST_MinimumBoundingCircle`/`MinimumClearance`, `ST_MakeEnvelope`/`MakePolygon`, `ST_Dump` family, `ST_Collect`/`ST_Union`/`ST_Envelope`/`ST_MakeLine` aggregates |
 | **Robustness on real-world (invalid / over-complex) polygons** | ✅ Done — `ST_MakeValid` + an internal `ensure_valid` guard across all relate/boolean ops, plus a custom iterative ray-cast PIP for `ST_Within`/`ST_Contains` (so 100k+ vertex polygons no longer crash). See `benchmarks/BENCHMARKS.md`. |
 | **Spatial joins at scale** | ✅ Done — two paths: (1) `sedona_join(a.parquet, b.parquet, predicate)` R*-tree table function over spilled parquet (the disk-spill model); (2) inline bbox-prefilter (`ST_XMin/Max/YMin/MaxY` + DuckDB IEJoin). |
 | **Geography (geodesic)** | ✅ Done — `ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere` (lon/lat → metres/m²). |

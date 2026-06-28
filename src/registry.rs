@@ -336,6 +336,30 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
         }};
     }
 
+    // -- (DOUBLE×4) -> Geometry (bbox constructor: ST_MakeEnvelope) --------
+    macro_rules! register_doubles4_geom {
+        ($name:expr, $func:path) => {{
+            unsafe extern "C" fn cb(
+                _info: duckdb_function_info,
+                input: duckdb_data_chunk,
+                output: duckdb_vector,
+            ) {
+                dispatch::doubles4_to_geom(input, output, $func);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($name)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+
     // -- (Geometry, Geometry) -> DOUBLE (measurements) ----------------------
     macro_rules! register_binary_double {
         ($name:expr, $func:path) => {{
@@ -482,6 +506,19 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_unary_geom!("st_geomfromewkb", functions::geom_from_wkb); // EWKB-tolerant from_wkb
     register_geom_varchar!("st_ashexewkb", functions::as_hex_ewkb);
 
+    // --- Tier 1/1b parity batch round 2: constructors, editing, measurement ---
+    register_doubles4_geom!("st_makeenvelope", functions::make_envelope);
+    register_unary_geom!("st_makepolygon", functions::make_polygon);
+    register_doubles2_geom!("st_makepoint", functions::point); // alias of ST_Point
+    register_geom_int_to_geom!("st_removepoint", functions::remove_point);
+    register_binary_geom!("st_addpoint", functions::add_point);
+    register_geom_double_to_geom!("st_simplifypreservetopology", functions::simplify_preserve_topology);
+    register_geom_double!("st_minimumclearance", functions::minimum_clearance);
+    register_unary_geom!("st_minimumclearanceline", functions::minimum_clearance_line);
+    register_geom_double_to_geom!("st_minimumboundingcircle", functions::minimum_bounding_circle);
+    register_geom_int_to_geom!("st_generatepoints", functions::generate_points);
+    register_geom_varchar!("st_isvalidreason", functions::is_valid_reason);
+
     // (geom, int) -> geom
     register_geom_int_to_geom!("st_geometryn", functions::geometry_n);
     register_geom_int_to_geom!("st_pointn", functions::point_n);
@@ -590,6 +627,20 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .register(con)?;
     }
 
+    // --- aggregate: ST_MakeLine (points → LineString) --------------------
+    unsafe {
+        AggregateFunctionBuilder::new("st_makeline_agg")
+            .param(TypeId::Blob)
+            .returns(TypeId::Blob)
+            .state_size(dispatch::make_line_state_size)
+            .init(dispatch::make_line_state_init)
+            .update(dispatch::make_line_update)
+            .combine(dispatch::make_line_combine)
+            .finalize(dispatch::make_line_finalize)
+            .destructor(dispatch::make_line_destroy)
+            .register(con)?;
+    }
+
     // --- table function: sedona_join (R-tree spatial join over two parquet files)
     unsafe {
         TableFunctionBuilder::new("sedona_join")
@@ -616,6 +667,28 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .bind(crate::raster::raster_stats_bind)
             .init(crate::raster::raster_stats_init)
             .scan(crate::raster::raster_stats_scan)
+            .register(con)?;
+    }
+
+    // --- set-returning table functions: ST_Dump family -------------------
+    unsafe {
+        TableFunctionBuilder::new("st_dump")
+            .param(TypeId::Blob)
+            .bind(crate::dump::dump_bind)
+            .init(crate::dump::dump_init)
+            .scan(crate::dump::dump_scan)
+            .register(con)?;
+        TableFunctionBuilder::new("st_dumppoints")
+            .param(TypeId::Blob)
+            .bind(crate::dump::dump_points_bind)
+            .init(crate::dump::dump_points_init)
+            .scan(crate::dump::dump_points_scan)
+            .register(con)?;
+        TableFunctionBuilder::new("st_dumpsegments")
+            .param(TypeId::Blob)
+            .bind(crate::dump::dump_segments_bind)
+            .init(crate::dump::dump_segments_init)
+            .scan(crate::dump::dump_segments_scan)
             .register(con)?;
     }
 

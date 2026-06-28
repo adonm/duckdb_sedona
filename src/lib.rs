@@ -44,6 +44,7 @@ pub mod geometry;
 pub mod raster;
 pub mod registry;
 pub mod spatial_join;
+pub mod dump;
 
 use quack_rs::entry_point;
 

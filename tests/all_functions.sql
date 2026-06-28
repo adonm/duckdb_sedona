@@ -90,3 +90,27 @@ SELECT CASE WHEN st_asewkb(st_point(1,2)) IS NOT NULL THEN 'PASS' ELSE 'FAIL ase
 SELECT CASE WHEN st_astext(st_geomfromewkb(st_asewkb(st_point(1,2)))) = 'POINT(1 2)' THEN 'PASS' ELSE 'FAIL geomfromewkb' END;
 SELECT CASE WHEN length(st_ashexewkb(st_point(1,2))) = 42 THEN 'PASS' ELSE 'FAIL ashexewkb' END;
 SELECT CASE WHEN abs(st_area(st_triangulatepolygon(st_geomfromtext('POLYGON((0 0,2 0,2 2,0 2,0 0))'))) - 4.0) < 0.0001 THEN 'PASS' ELSE 'FAIL triangulatepolygon' END;
+
+-- === Set-returning table functions: ST_Dump family ===
+SELECT CASE WHEN (SELECT count(*) FROM st_dump(st_geomfromtext('MULTIPOLYGON(((0 0,1 0,1 1,0 0)),((2 2,3 2,3 3,2 2)))'))) = 2 THEN 'PASS' ELSE 'FAIL dump' END;
+SELECT CASE WHEN (SELECT count(*) FROM st_dump(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 0))'))) = 1 THEN 'PASS' ELSE 'FAIL dump_atomic' END;
+SELECT CASE WHEN (SELECT path FROM st_dump(st_geomfromtext('GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4))')) ORDER BY path) = '{1}' THEN 'PASS' ELSE 'FAIL dump_path' END;
+SELECT CASE WHEN (SELECT count(*) FROM st_dumppoints(st_geomfromtext('LINESTRING(0 0,1 1,2 2)'))) = 3 THEN 'PASS' ELSE 'FAIL dumppoints' END;
+SELECT CASE WHEN (SELECT count(*) FROM st_dumpsegments(st_geomfromtext('LINESTRING(0 0,1 1,2 2)'))) = 2 THEN 'PASS' ELSE 'FAIL dumpsegments' END;
+SELECT CASE WHEN (SELECT count(*) FROM st_dumppoints(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 0))'))) = 4 THEN 'PASS' ELSE 'FAIL dumppoints_polygon' END;
+
+-- === Tier 1/1b round 2 (constructors, editing, measurements, validity) ===
+SELECT CASE WHEN st_area(st_makeenvelope(0,0,4,4)) = 16.0 THEN 'PASS' ELSE 'FAIL makeenvelope' END;
+SELECT CASE WHEN st_geometrytype(st_makepolygon(st_geomfromtext('LINESTRING(0 0,1 0,1 1,0 0)'))) = 'ST_Polygon' THEN 'PASS' ELSE 'FAIL makepolygon' END;
+SELECT CASE WHEN st_astext(st_makepoint(3,4)) = 'POINT(3 4)' THEN 'PASS' ELSE 'FAIL makepoint' END;
+SELECT CASE WHEN st_numpoints(st_removepoint(st_geomfromtext('LINESTRING(0 0,1 1,2 2)'),1)) = 2 THEN 'PASS' ELSE 'FAIL removepoint' END;
+SELECT CASE WHEN st_numpoints(st_addpoint(st_geomfromtext('LINESTRING(0 0,1 1)'),st_point(2,2))) = 3 THEN 'PASS' ELSE 'FAIL addpoint' END;
+SELECT CASE WHEN st_isvalid(st_simplifypreservetopology(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))'),0.1)) = true THEN 'PASS' ELSE 'FAIL simplifypreservetopology' END;
+SELECT CASE WHEN st_minimumclearance(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))') ) > 0 THEN 'PASS' ELSE 'FAIL minimumclearance' END;
+SELECT CASE WHEN st_minimumclearanceline(st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))')) IS NOT NULL THEN 'PASS' ELSE 'FAIL minimumclearanceline' END;
+SELECT CASE WHEN st_minimumboundingcircle(st_geomfromtext('MULTIPOINT(0 0,2 0,1 1,1 -1)'),32) IS NOT NULL THEN 'PASS' ELSE 'FAIL minimumboundingcircle' END;
+SELECT CASE WHEN st_numgeometries(st_generatepoints(st_geomfromtext('POLYGON((0 0,10 0,10 10,0 10,0 0))'),20)) = 20 THEN 'PASS' ELSE 'FAIL generatepoints' END;
+SELECT CASE WHEN st_isvalidreason(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 1,0 0))')) = 'Valid Geometry' THEN 'PASS' ELSE 'FAIL isvalidreason' END;
+
+-- === Aggregate: ST_MakeLine ===
+SELECT CASE WHEN st_astext(st_makeline_agg(g ORDER BY k)) = 'LINESTRING(0 0,1 1,2 2)' THEN 'PASS' ELSE 'FAIL makeline_agg' FROM (SELECT 0 k, st_point(0,0) g UNION ALL SELECT 1, st_point(1,1) UNION ALL SELECT 2, st_point(2,2));

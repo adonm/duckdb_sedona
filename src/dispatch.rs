@@ -26,9 +26,7 @@
 
 use geo_types::{Geometry, MultiPolygon};
 use libduckdb_sys::{
-    duckdb_aggregate_state, duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
-    duckdb_function_info, duckdb_vector, duckdb_vector_get_data, duckdb_vector_get_validity,
-    duckdb_validity_row_is_valid, idx_t,
+    duckdb_aggregate_state, duckdb_data_chunk, duckdb_function_info, duckdb_vector, idx_t,
 };
 use quack_rs::aggregate::{AggregateState, FfiState};
 use quack_rs::data_chunk::DataChunk;
@@ -36,74 +34,32 @@ use quack_rs::vector::{VectorReader, VectorWriter};
 
 use crate::geometry::{self, Geom};
 
-/// Size of a `duckdb_string_t` (inline + pointer union) in bytes.
-const STRING_T_SIZE: usize = 16;
-/// Strings ≤ this length are stored inline in the `duckdb_string_t`.
-const STRING_T_INLINE_MAX: usize = 12;
-
-/// Raw (non-UTF-8-validated) reader for a BLOB / VARCHAR column.
-///
-/// Holds a borrowed view of one column's data buffer + validity bitmap for the
-/// lifetime of the enclosing data chunk.
-struct BlobCol {
-    data: *const u8,
-    validity: *mut u64,
-    n: usize,
-}
-
-impl BlobCol {
-    /// # Safety
-    /// `chunk` must be a valid `duckdb_data_chunk` for the lifetime of this
-    /// reader; `col` must be a valid BLOB/VARCHAR column index.
-    unsafe fn new(chunk: duckdb_data_chunk, col: usize) -> Self {
-        let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(chunk) }).unwrap_or(0);
-        let vector = unsafe { duckdb_data_chunk_get_vector(chunk, col as idx_t) };
-        let data = unsafe { duckdb_vector_get_data(vector) }.cast::<u8>();
-        let validity = unsafe { duckdb_vector_get_validity(vector) };
-        Self { data, validity, n }
-    }
-
-    /// Returns the raw bytes of the value at `row`, or `None` if the row is
-    /// NULL or out of range.
-    ///
-    /// # Safety
-    /// The reader must outlive the returned slice (it borrows from DuckDB's
-    /// vector memory). `row` is bounds-checked internally.
-    unsafe fn get(&self, row: usize) -> Option<&[u8]> {
-        if row >= self.n {
-            return None;
-        }
-        if !self.validity.is_null()
-            && !unsafe { duckdb_validity_row_is_valid(self.validity, row as idx_t) }
-        {
-            return None;
-        }
-        // The duckdb_string_t for this row starts at `data + row * 16`.
-        let st = unsafe { self.data.add(row * STRING_T_SIZE) };
-        // SAFETY: st points to a valid 16-byte string_t.
-        let raw: &[u8; STRING_T_SIZE] = unsafe { &*st.cast::<[u8; STRING_T_SIZE]>() };
-        let len = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-        if len <= STRING_T_INLINE_MAX {
-            // Inline: the value lives in bytes [4..4+len].
-            Some(&raw[4..4 + len])
-        } else {
-            // Pointer: bytes [8..16] hold the heap pointer.
-            let pb: [u8; 8] = raw[8..16].try_into().ok()?;
-            let ptr = u64::from_le_bytes(pb) as *const u8;
-            if ptr.is_null() {
-                return None;
-            }
-            // SAFETY: DuckDB allocated `len` bytes at `ptr`; valid for the
-            // chunk's lifetime.
-            Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-        }
-    }
-}
-
 /// Read & parse the geometry at `row` of a BLOB column.
-fn read_geom(col: &BlobCol, row: usize) -> Option<Geom> {
-    let bytes = unsafe { col.get(row) }?;
+///
+/// The `VectorReader::read_blob` we delegate to is the binary-safe reader from
+/// our vendored `quack-rs` (upstream's routed BLOBs through a UTF-8-validating
+/// string reader and returned empty bytes for non-UTF-8 WKB — the bug that
+/// originally forced this extension to hand-roll a `BlobCol` reader; that
+/// workaround is gone now that the fix lives at the source).
+fn read_geom(col: &VectorReader, row: usize) -> Option<Geom> {
+    // SAFETY: callers loop `row` over `col.row_count()`, so `row` is in bounds.
+    if !unsafe { col.is_valid(row) } {
+        return None;
+    }
+    // SAFETY: as above; the column is a BLOB (ISO-WKB) column.
+    let bytes = unsafe { col.read_blob(row) };
     geometry::from_wkb(bytes).ok()
+}
+
+/// Read the raw bytes at `row` of a BLOB column (validity-checked), without
+/// parsing. Used by the aggregate `update` callbacks, which need the raw WKB.
+fn read_blob(col: &VectorReader, row: usize) -> Option<&[u8]> {
+    // SAFETY: callers loop `row` over `col.row_count()`.
+    if !unsafe { col.is_valid(row) } {
+        return None;
+    }
+    // SAFETY: as above; column is a BLOB column.
+    Some(unsafe { col.read_blob(row) })
 }
 
 /// Vectorized executor for `(geometry, INTEGER) -> geometry` accessors
@@ -113,11 +69,11 @@ where
     F: Fn(&Geom, i32) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let idx = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let (Some(g), Some(i)) = (read_geom(&geom, row), read_i32(&idx, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -135,11 +91,11 @@ where
     F: Fn(&Geom, i32) -> Option<String>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let idx = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let (Some(g), Some(i)) = (read_geom(&geom, row), read_i32(&idx, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -158,12 +114,12 @@ where
     F: Fn(&Geom, i32, i32) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let a = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let b = unsafe { VectorReader::new(chunk.as_raw(), 2) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let (Some(g), Some(from), Some(to)) =
             (read_geom(&geom, row), read_i32(&a, row), read_i32(&b, row))
         else {
@@ -206,10 +162,10 @@ where
 {
     // SAFETY: `input`/`output` are valid DuckDB handles handed to our callback.
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let reader = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..reader.n {
+    for row in 0..reader.row_count() {
         let Some(g) = read_geom(&reader, row) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -228,11 +184,11 @@ where
     F: Fn(&Geom, &Geom) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let left = unsafe { BlobCol::new(chunk.as_raw(), 0) };
-    let right = unsafe { BlobCol::new(chunk.as_raw(), 1) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..left.n {
+    for row in 0..left.row_count() {
         let (Some(a), Some(b)) = (read_geom(&left, row), read_geom(&right, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -255,11 +211,11 @@ where
     F: Fn(&Geom, &Geom) -> Option<bool>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let left = unsafe { BlobCol::new(chunk.as_raw(), 0) };
-    let right = unsafe { BlobCol::new(chunk.as_raw(), 1) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..left.n {
+    for row in 0..left.row_count() {
         let (Some(a), Some(b)) = (read_geom(&left, row), read_geom(&right, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -281,10 +237,10 @@ where
     F: Fn(&Geom) -> Option<f64>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let reader = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..reader.n {
+    for row in 0..reader.row_count() {
         match read_geom(&reader, row).and_then(|g| f(&g)) {
             Some(v) => unsafe { writer.write_f64(row, v) },
             None => unsafe { writer.set_null(row) },
@@ -298,10 +254,10 @@ where
     F: Fn(&Geom) -> Option<String>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let reader = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..reader.n {
+    for row in 0..reader.row_count() {
         match read_geom(&reader, row).and_then(|g| f(&g)) {
             Some(v) => unsafe { writer.write_varchar(row, &v) },
             None => unsafe { writer.set_null(row) },
@@ -315,10 +271,10 @@ where
     F: Fn(&Geom) -> Option<i32>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let reader = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..reader.n {
+    for row in 0..reader.row_count() {
         match read_geom(&reader, row).and_then(|g| f(&g)) {
             Some(v) => unsafe { writer.write_i32(row, v) },
             None => unsafe { writer.set_null(row) },
@@ -332,10 +288,10 @@ where
     F: Fn(&Geom) -> Option<bool>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let reader = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..reader.n {
+    for row in 0..reader.row_count() {
         match read_geom(&reader, row).and_then(|g| f(&g)) {
             Some(v) => unsafe { writer.write_bool(row, v) },
             None => unsafe { writer.set_null(row) },
@@ -377,11 +333,11 @@ where
     F: Fn(&Geom, f64) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let scalar = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let (Some(g), Some(v)) = (read_geom(&geom, row), read_f64(&scalar, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -400,12 +356,12 @@ where
     F: Fn(&Geom, f64, f64) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let s1 = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let s2 = unsafe { VectorReader::new(chunk.as_raw(), 2) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let (Some(g), Some(a), Some(b)) =
             (read_geom(&geom, row), read_f64(&s1, row), read_f64(&s2, row))
         else {
@@ -426,7 +382,7 @@ where
     F: Fn(&Geom, f64, f64, f64, f64, f64, f64) -> Option<Geom>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
     let s = [
         unsafe { VectorReader::new(chunk.as_raw(), 1) },
         unsafe { VectorReader::new(chunk.as_raw(), 2) },
@@ -437,7 +393,7 @@ where
     ];
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..geom.n {
+    for row in 0..geom.row_count() {
         let Some(g) = read_geom(&geom, row) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -452,6 +408,38 @@ where
             continue;
         };
         match f(&g, a, b, c, d, e, ff).and_then(|out| geometry::to_wkb(&out).ok()) {
+            Some(bytes) => unsafe { writer.write_blob(row, &bytes) },
+            None => unsafe { writer.set_null(row) },
+        }
+    }
+}
+
+/// Vectorized executor for `(DOUBLE×4) -> geometry` constructors
+/// (`ST_MakeEnvelope`).
+pub fn doubles4_to_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
+where
+    F: Fn(f64, f64, f64, f64) -> Option<Geom>,
+{
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let s = [
+        unsafe { VectorReader::new(chunk.as_raw(), 0) },
+        unsafe { VectorReader::new(chunk.as_raw(), 1) },
+        unsafe { VectorReader::new(chunk.as_raw(), 2) },
+        unsafe { VectorReader::new(chunk.as_raw(), 3) },
+    ];
+    let mut writer = unsafe { VectorWriter::new(output) };
+
+    for row in 0..s[0].row_count() {
+        let vals: Option<[f64; 4]> = s
+            .iter()
+            .map(|r| read_f64(r, row))
+            .collect::<Option<Vec<_>>>()
+            .map(|v| [v[0], v[1], v[2], v[3]]);
+        let Some([a, b, c, d]) = vals else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        match f(a, b, c, d).and_then(|g| geometry::to_wkb(&g).ok()) {
             Some(bytes) => unsafe { writer.write_blob(row, &bytes) },
             None => unsafe { writer.set_null(row) },
         }
@@ -485,11 +473,11 @@ where
     F: Fn(&Geom, &Geom) -> Option<f64>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let left = unsafe { BlobCol::new(chunk.as_raw(), 0) };
-    let right = unsafe { BlobCol::new(chunk.as_raw(), 1) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..left.n {
+    for row in 0..left.row_count() {
         let (Some(a), Some(b)) = (read_geom(&left, row), read_geom(&right, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -508,12 +496,12 @@ where
     F: Fn(&Geom, &Geom, f64) -> Option<bool>,
 {
     let chunk = unsafe { DataChunk::from_raw(input) };
-    let left = unsafe { BlobCol::new(chunk.as_raw(), 0) };
-    let right = unsafe { BlobCol::new(chunk.as_raw(), 1) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
     let scalar = unsafe { VectorReader::new(chunk.as_raw(), 2) };
     let mut writer = unsafe { VectorWriter::new(output) };
 
-    for row in 0..left.n {
+    for row in 0..left.row_count() {
         let (Some(a), Some(b)) = (read_geom(&left, row), read_geom(&right, row)) else {
             unsafe { writer.set_null(row) };
             continue;
@@ -557,9 +545,9 @@ pub unsafe extern "C" fn collect_update(
     input: duckdb_data_chunk,
     states: *mut duckdb_aggregate_state,
 ) {
-    let col = unsafe { BlobCol::new(input, 0) };
-    for row in 0..col.n {
-        let Some(bytes) = (unsafe { col.get(row) }) else { continue };
+    let col = unsafe { VectorReader::new(input, 0) };
+    for row in 0..col.row_count() {
+        let Some(bytes) = read_blob(&col, row) else { continue };
         let Ok(g) = geometry::from_wkb(bytes) else { continue };
         // SAFETY: `states` has one entry per input row.
         let state_ptr = unsafe { *states.add(row) };
@@ -663,8 +651,8 @@ pub unsafe extern "C" fn envelope_update(
     input: duckdb_data_chunk,
     states: *mut duckdb_aggregate_state,
 ) {
-    let col = unsafe { BlobCol::new(input, 0) };
-    for row in 0..col.n {
+    let col = unsafe { VectorReader::new(input, 0) };
+    for row in 0..col.row_count() {
         let Some(g) = read_geom(&col, row) else { continue };
         let state_ptr = unsafe { *states.add(row) };
         if let Some(st) = unsafe { FfiState::<EnvelopeAggState>::with_state_mut(state_ptr) } {
@@ -788,8 +776,8 @@ pub unsafe extern "C" fn union_update(
     states: *mut duckdb_aggregate_state,
 ) {
     use geo::algorithm::bool_ops::BooleanOps;
-    let col = unsafe { BlobCol::new(input, 0) };
-    for row in 0..col.n {
+    let col = unsafe { VectorReader::new(input, 0) };
+    for row in 0..col.row_count() {
         let Some(g) = read_geom(&col, row) else { continue };
         // SAFETY: `states` has one entry per input row.
         let state_ptr = unsafe { *states.add(row) };
@@ -854,4 +842,104 @@ pub unsafe extern "C" fn union_finalize(
 }
 pub unsafe extern "C" fn union_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
     unsafe { FfiState::<UnionAggState>::destroy_callback(states, count) };
+}
+
+// ---------------------------------------------------------------------------
+// ST_MakeLine aggregate (points → LineString)
+// ---------------------------------------------------------------------------
+
+/// Per-group state for `ST_MakeLine`: the accumulated vertex sequence. Points
+/// contribute their single coordinate; LineStrings contribute all of theirs.
+/// Non-point/linestring inputs are ignored (PostGIS only combines points/lines).
+#[derive(Default)]
+pub struct MakeLineAggState {
+    pub coords: Vec<geo_types::Coord<f64>>,
+}
+impl AggregateState for MakeLineAggState {}
+
+/// Append the coordinates of a point/linestring-bearing geometry to `coords`.
+fn append_line_coords(g: &Geom, coords: &mut Vec<geo_types::Coord<f64>>) {
+    match g {
+        Geometry::Point(p) => coords.push(p.0),
+        Geometry::MultiPoint(mp) => coords.extend(mp.0.iter().map(|p| p.0)),
+        Geometry::LineString(ls) => coords.extend(ls.0.iter().copied()),
+        Geometry::MultiLineString(mls) => {
+            for ls in &mls.0 {
+                coords.extend(ls.0.iter().copied());
+            }
+        }
+        Geometry::GeometryCollection(c) => {
+            for item in &c.0 {
+                append_line_coords(item, coords);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub unsafe extern "C" fn make_line_state_size(info: duckdb_function_info) -> idx_t {
+    unsafe { FfiState::<MakeLineAggState>::size_callback(info) }
+}
+pub unsafe extern "C" fn make_line_state_init(info: duckdb_function_info, state: duckdb_aggregate_state) {
+    unsafe { FfiState::<MakeLineAggState>::init_callback(info, state) };
+}
+pub unsafe extern "C" fn make_line_update(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+) {
+    let col = unsafe { VectorReader::new(input, 0) };
+    for row in 0..col.row_count() {
+        let Some(g) = read_geom(&col, row) else { continue };
+        // SAFETY: `states` has one entry per input row.
+        let state_ptr = unsafe { *states.add(row) };
+        let Some(st) = (unsafe { FfiState::<MakeLineAggState>::with_state_mut(state_ptr) }) else { continue };
+        append_line_coords(&g, &mut st.coords);
+    }
+}
+pub unsafe extern "C" fn make_line_combine(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: idx_t,
+) {
+    for i in 0..count as usize {
+        let src_ptr = unsafe { *source.add(i) };
+        let tgt_ptr = unsafe { *target.add(i) };
+        let (src, tgt) = unsafe {
+            (
+                FfiState::<MakeLineAggState>::with_state(src_ptr),
+                FfiState::<MakeLineAggState>::with_state_mut(tgt_ptr),
+            )
+        };
+        if let (Some(s), Some(t)) = (src, tgt) {
+            t.coords.extend(s.coords.iter().copied());
+        }
+    }
+}
+pub unsafe extern "C" fn make_line_finalize(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+) {
+    let mut writer = unsafe { VectorWriter::new(result) };
+    for i in 0..count as usize {
+        let out_row = offset as usize + i;
+        let state_ptr = unsafe { *source.add(i) };
+        match unsafe { FfiState::<MakeLineAggState>::with_state(state_ptr) } {
+            Some(st) if st.coords.len() >= 2 => {
+                let ls = Geometry::LineString(geo_types::LineString(st.coords.clone()));
+                match geometry::to_wkb(&ls) {
+                    Ok(b) => unsafe { writer.write_blob(out_row, &b) },
+                    Err(_) => unsafe { writer.set_null(out_row) },
+                }
+            }
+            _ => unsafe { writer.set_null(out_row) },
+        }
+    }
+}
+pub unsafe extern "C" fn make_line_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
+    unsafe { FfiState::<MakeLineAggState>::destroy_callback(states, count) };
 }

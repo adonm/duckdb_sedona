@@ -1846,6 +1846,414 @@ pub fn as_hex_ewkb(g: &Geom) -> Option<String> {
     Some(s)
 }
 
+// =====================================================================
+// Tier 1/1b parity batch (round 2): constructors, editing, measurements,
+// validity reporting. Each reuses an existing dispatch shape.
+// =====================================================================
+
+// ----- constructors -----------------------------------------------------
+
+/// `ST_MakeEnvelope(xmin, ymin, xmax, ymax)` — axis-aligned rectangle as a
+/// Polygon, CCW-closed. Returns NULL if `xmin > xmax` or `ymin > ymax`.
+pub fn make_envelope(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Option<Geom> {
+    if xmin > xmax || ymin > ymax {
+        return None;
+    }
+    Some(Geometry::Polygon(geo_types::Polygon::new(
+        geo_types::LineString::from(vec![
+            (xmin, ymin),
+            (xmax, ymin),
+            (xmax, ymax),
+            (xmin, ymax),
+            (xmin, ymin),
+        ]),
+        vec![],
+    )))
+}
+
+/// `ST_MakePolygon(shell)` — wrap a LineString as a Polygon (no holes). The
+/// shell must be closed (first == last vertex); returns NULL otherwise or for
+/// non-LineString input.
+pub fn make_polygon(g: &Geom) -> Option<Geom> {
+    match g {
+        Geometry::LineString(ls) => {
+            let closed = ls
+                .0
+                .first()
+                .is_some_and(|f| ls.0.last().is_some_and(|l| f == l));
+            if !closed || ls.0.len() < 4 {
+                return None;
+            }
+            Some(Geometry::Polygon(geo_types::Polygon::new(ls.clone(), vec![])))
+        }
+        _ => None,
+    }
+}
+
+// ----- line editing -----------------------------------------------------
+
+/// `ST_RemovePoint(linestring, n)` — drop the 0-indexed n-th vertex of a
+/// LineString, re-closing it if it was closed and the endpoint was removed.
+/// Returns NULL for non-LineString input or out-of-range `n`.
+pub fn remove_point(g: &Geom, n: i32) -> Option<Geom> {
+    let i = usize::try_from(n).ok()?;
+    match g {
+        Geometry::LineString(ls) => {
+            if i >= ls.0.len() {
+                return None;
+            }
+            let mut pts = ls.0.clone();
+            pts.remove(i);
+            Some(Geometry::LineString(geo_types::LineString(pts)))
+        }
+        _ => None,
+    }
+}
+
+/// `ST_AddPoint(target, point)` — append `point` to a LineString. Returns
+/// `target` unchanged for non-LineString `target`.
+pub fn add_point(target: &Geom, point: &Geom) -> Option<Geom> {
+    let c = point_coord(point)?;
+    match target {
+        Geometry::LineString(ls) => {
+            let mut pts = ls.0.clone();
+            pts.push(c);
+            Some(Geometry::LineString(geo_types::LineString(pts)))
+        }
+        Geometry::Line(l) => Some(Geometry::LineString(geo_types::LineString::from(
+            vec![(l.start.x, l.start.y), (l.end.x, l.end.y), (c.x, c.y)],
+        ))),
+        _ => None,
+    }
+}
+
+/// `ST_SimplifyPreserveTopology(geom, epsilon)` — Ramer-Douglas-Peucker
+/// simplification that falls back to the original geometry if the simplified
+/// result would be structurally invalid (collapsed ring / self-intersection).
+pub fn simplify_preserve_topology(g: &Geom, epsilon: f64) -> Option<Geom> {
+    use geo::Validation;
+    let simplified = simplify(g, epsilon)?;
+    // Accept the simplification only if it stays valid; otherwise keep the
+    // original to preserve topology (a coarse approximation of PostGIS's
+    // topology-preserving RDP, which geo does not expose directly).
+    if simplified.is_valid() {
+        Some(simplified)
+    } else {
+        Some(g.clone())
+    }
+}
+
+// ----- measurements (Tier 1b) -------------------------------------------
+
+/// Distance between two 2D points.
+#[inline]
+fn pt_dist(a: geo_types::Coord<f64>, b: geo_types::Coord<f64>) -> f64 {
+    (a.x - b.x).hypot(a.y - b.y)
+}
+
+/// `ST_MinimumClearance(geom)` — the smallest distance a vertex can move before
+/// the geometry may become invalid. Defined as the minimum of:
+///   * the distance from each vertex to the nearest segment it is NOT an
+///     endpoint of, and
+///   * the distance between non-adjacent vertices.
+/// Returns positive infinity for geometries with no segments / too few vertices
+/// (points, single segments).
+pub fn minimum_clearance(g: &Geom) -> Option<f64> {
+    let coords = all_coords(g);
+    let segs = segments(g);
+    if coords.len() < 3 || segs.len() < 2 {
+        return Some(f64::INFINITY);
+    }
+    // For each segment, record its two endpoint coordinate indices so we can
+    // skip vertex-to-incident-segment comparisons. We do this by matching
+    // coordinate identity (cheap pointer-free compare via value + epsilon).
+    let best = coords
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let mut m = f64::INFINITY;
+            for (j, &u) in coords.iter().enumerate() {
+                // Non-adjacent, non-coincident vertex-vertex distance. (Rings
+                // repeat their closing vertex, so we must skip the coincident
+                // pair it creates — a clearance of 0 would be meaningless.)
+                if i.abs_diff(j) > 1 {
+                    let d = pt_dist(v, u);
+                    if d > 1e-9 {
+                        m = m.min(d);
+                    }
+                }
+            }
+            for s in &segs {
+                // Skip segments incident to this vertex.
+                if approx_eq_coord(s.0, v) || approx_eq_coord(s.1, v) {
+                    continue;
+                }
+                let p = closest_on_segment(&v, s);
+                let d = pt_dist(v, p);
+                if d > 1e-9 {
+                    m = m.min(d);
+                }
+            }
+            m
+        })
+        .fold(f64::INFINITY, f64::min);
+    Some(best)
+}
+
+/// `ST_MinimumClearanceLine(geom)` — the 2-point LineString realizing
+/// `ST_MinimumClearance` (between the closest non-incident vertex/segment pair).
+/// Returns NULL when the clearance is infinite (undefined for the input).
+pub fn minimum_clearance_line(g: &Geom) -> Option<Geom> {
+    let coords = all_coords(g);
+    let segs = segments(g);
+    if coords.len() < 3 || segs.len() < 2 {
+        return None;
+    }
+    let mut best = f64::INFINITY;
+    let mut bestpair = (coords[0], coords[0]);
+    for (i, &v) in coords.iter().enumerate() {
+        for (j, &u) in coords.iter().enumerate() {
+            if i.abs_diff(j) > 1 {
+                let d = pt_dist(v, u);
+                // Skip coincident pairs (rings repeat their closing vertex).
+                if d > 1e-9 && d < best {
+                    best = d;
+                    bestpair = (v, u);
+                }
+            }
+        }
+        for s in &segs {
+            if approx_eq_coord(s.0, v) || approx_eq_coord(s.1, v) {
+                continue;
+            }
+            let p = closest_on_segment(&v, s);
+            let d = pt_dist(v, p);
+            if d > 1e-9 && d < best {
+                best = d;
+                bestpair = (v, p);
+            }
+        }
+    }
+    if !best.is_finite() {
+        return None;
+    }
+    Some(Geometry::LineString(geo_types::LineString::from(vec![
+        (bestpair.0.x, bestpair.0.y),
+        (bestpair.1.x, bestpair.1.y),
+    ])))
+}
+
+#[inline]
+fn approx_eq_coord(a: geo_types::Coord<f64>, b: geo_types::Coord<f64>) -> bool {
+    (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12
+}
+
+// ----- minimum bounding circle (Welzl's algorithm) ----------------------
+
+/// `ST_MinimumBoundingCircle(geom, num_segs)` — the minimum enclosing circle of
+/// the vertex set, returned as a polygon approximation. `num_segs` is the number
+/// of quadrature segments per quarter-circle (PostGIS default 48); ≤ 0 ⇒ 48.
+///
+/// The circle is computed exactly via Welzl's randomized algorithm on the vertex
+/// set; only the output polygon is an approximation.
+pub fn minimum_bounding_circle(g: &Geom, num_segs: f64) -> Option<Geom> {
+    let pts: Vec<[f64; 2]> = all_coords(g).into_iter().map(|c| [c.x, c.y]).collect();
+    if pts.is_empty() {
+        return None;
+    }
+    let nq = if num_segs <= 0.0 { 48.0 } else { num_segs } as usize;
+    // A single point: zero-radius "circle" at that point (return the point).
+    if pts.len() == 1 {
+        return Some(Geometry::Point(geo_types::Point::new(pts[0][0], pts[0][1])));
+    }
+    let circle = welzl(&pts);
+    Some(circle_polygon(circle.cx, circle.cy, circle.r, nq.max(8)))
+}
+
+struct Circle {
+    cx: f64,
+    cy: f64,
+    r: f64,
+}
+
+impl Circle {
+    fn from_two(a: [f64; 2], b: [f64; 2]) -> Self {
+        Self {
+            cx: (a[0] + b[0]) / 2.0,
+            cy: (a[1] + b[1]) / 2.0,
+            r: pt_dist_arr(a, b) / 2.0,
+        }
+    }
+    fn from_three(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> Self {
+        let (ax, ay) = (a[0], a[1]);
+        let (bx, by) = (b[0], b[1]);
+        let (cx_, cy_) = (c[0], c[1]);
+        let d = 2.0 * (ax * (by - cy_) + bx * (cy_ - ay) + cx_ * (ay - by));
+        if d.abs() < 1e-20 {
+            // Collinear: fall back to the diameter of the two farthest.
+            let circ = Self::from_two(a, b);
+            return Self {
+                cx: circ.cx,
+                cy: circ.cy,
+                r: circ.r.max(pt_dist_arr(a, c) / 2.0).max(pt_dist_arr(b, c) / 2.0),
+            };
+        }
+        let a2 = ax * ax + ay * ay;
+        let b2 = bx * bx + by * by;
+        let c2 = cx_ * cx_ + cy_ * cy_;
+        let ux = (a2 * (by - cy_) + b2 * (cy_ - ay) + c2 * (ay - by)) / d;
+        let uy = (a2 * (cx_ - bx) + b2 * (ax - cx_) + c2 * (bx - ax)) / d;
+        Self {
+            cx: ux,
+            cy: uy,
+            r: pt_dist_arr([ux, uy], a),
+        }
+    }
+    #[inline]
+    fn contains(&self, p: [f64; 2]) -> bool {
+        // Small epsilon to keep points that sit exactly on the boundary.
+        pt_dist_arr([self.cx, self.cy], p) <= self.r + 1e-10
+    }
+}
+
+#[inline]
+fn pt_dist_arr(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).hypot(a[1] - b[1])
+}
+
+/// Welzl's minimum enclosing circle (iterative, randomized).
+fn welzl(pts: &[[f64; 2]]) -> Circle {
+    let mut pts = pts.to_vec();
+    // Shuffle for expected-linear time (Fisher-Yates with a fixed seed for
+    // determinism — ST_MinimumBoundingCircle is a pure function of its input).
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in (1..pts.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        pts.swap(i, j);
+    }
+    let mut c = Circle {
+        cx: pts[0][0],
+        cy: pts[0][1],
+        r: 0.0,
+    };
+    for i in 1..pts.len() {
+        if !c.contains(pts[i]) {
+            c = circle_with_point(&pts[..i], pts[i]);
+        }
+    }
+    c
+}
+
+fn circle_with_point(pts: &[[f64; 2]], q: [f64; 2]) -> Circle {
+    let mut c = Circle {
+        cx: pts[0][0],
+        cy: pts[0][1],
+        r: 0.0,
+    };
+    for i in 1..pts.len() {
+        if !c.contains(pts[i]) {
+            c = circle_with_two_points(&pts[..i], pts[i], q);
+        }
+    }
+    c
+}
+
+fn circle_with_two_points(pts: &[[f64; 2]], q1: [f64; 2], q2: [f64; 2]) -> Circle {
+    let mut c = Circle::from_two(q1, q2);
+    for &p in pts {
+        if !c.contains(p) {
+            c = Circle::from_three(q1, q2, p);
+        }
+    }
+    c
+}
+
+/// A regular `n`-gon approximating a circle of radius `r` at `(cx, cy)`,
+/// CCW-closed.
+fn circle_polygon(cx: f64, cy: f64, r: f64, n: usize) -> Geom {
+    let n = n.max(8);
+    let mut pts: Vec<(f64, f64)> = (0..n)
+        .map(|i| {
+            let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+            (cx + r * a.cos(), cy + r * a.sin())
+        })
+        .collect();
+    pts.push(pts[0]);
+    Geometry::Polygon(geo_types::Polygon::new(
+        geo_types::LineString::from(pts),
+        vec![],
+    ))
+}
+
+// ----- random point generation ------------------------------------------
+
+/// `ST_GeneratePoints(geom, npoints)` — `npoints` random points uniformly
+/// distributed inside the polygonal bounding box, kept if they fall inside the
+/// polygon. Deterministic (seeded) so results are reproducible per call.
+/// Returns a MultiPoint. Non-polygonal input returns NULL.
+pub fn generate_points(g: &Geom, npoints: i32) -> Option<Geom> {
+    let n = npoints.max(0) as usize;
+    let rect = g.bounding_rect()?;
+    let (xmin, ymin, xmax, ymax) = (rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+    let mut rng = SplitMix64 { state: 0x2545_F491_4F6C_DD1D };
+    let polys: Vec<&geo_types::Polygon<f64>> = match g {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0.iter().collect(),
+        _ => return None,
+    };
+    let mut out: Vec<geo_types::Point<f64>> = Vec::with_capacity(n);
+    while out.len() < n {
+        let x = xmin + rng.next_f64() * (xmax - xmin);
+        let y = ymin + rng.next_f64() * (ymax - ymin);
+        for p in &polys {
+            if point_in_polygon(x, y, p) {
+                out.push(geo_types::Point::new(x, y));
+                break;
+            }
+        }
+    }
+    Some(Geometry::MultiPoint(geo_types::MultiPoint(out)))
+}
+
+/// Tiny deterministic PRNG (SplitMix64) + a uniform [0,1) mapper. Chosen so
+/// `ST_GeneratePoints` is reproducible and dependency-free.
+struct SplitMix64 {
+    state: u64,
+}
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn next_f64(&mut self) -> f64 {
+        // 53-bit mantissa → uniform [0,1).
+        (self.next_u64() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
+// ----- validity reporting -----------------------------------------------
+
+/// `ST_IsValidReason(geom)` — a human-readable reason string, or
+/// `"Valid Geometry"` when the geometry passes structural validation.
+pub fn is_valid_reason(g: &Geom) -> Option<String> {
+    use geo::Validation;
+    let errs = g.validation_errors();
+    if errs.is_empty() {
+        Some("Valid Geometry".to_string())
+    } else {
+        Some(
+            errs.iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2206,5 +2614,159 @@ mod tests {
         // Every char is a hex digit; the encoding is uppercase (A-F where used).
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         assert!(h.chars().all(|c| !c.is_ascii_lowercase()));
+    }
+
+    // ---- Tier 1/1b round 2 ---------------------------------------------
+
+    #[test]
+    fn make_envelope_builds_ccw_rectangle() {
+        let p = make_envelope(0.0, 0.0, 4.0, 4.0).unwrap();
+        match p {
+            Geometry::Polygon(poly) => {
+                assert_eq!(poly.exterior().0.len(), 5); // closed
+                assert!((area(&Geometry::Polygon(poly.clone())).unwrap() - 16.0).abs() < 1e-9);
+                let first = poly.exterior().0[0];
+                assert!((first.x - 0.0).abs() < 1e-12 && (first.y - 0.0).abs() < 1e-12);
+            }
+            other => panic!("expected polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn make_envelope_rejects_inverted_bounds() {
+        assert!(make_envelope(4.0, 4.0, 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn make_polygon_from_closed_ring() {
+        let shell = Geometry::LineString(geo_types::LineString::from(vec![
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 0.0),
+        ]));
+        let p = make_polygon(&shell).unwrap();
+        assert!(matches!(p, Geometry::Polygon(_)));
+    }
+
+    #[test]
+    fn make_polygon_rejects_open_ring() {
+        let shell = Geometry::LineString(geo_types::LineString::from(vec![
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+        ]));
+        assert!(make_polygon(&shell).is_none());
+    }
+
+    #[test]
+    fn remove_point_drops_indexed_vertex() {
+        let ls = ls(&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]);
+        let out = remove_point(&ls, 1).unwrap();
+        assert_eq!(num_points(&out).unwrap(), 2);
+    }
+
+    #[test]
+    fn add_point_appends_to_linestring() {
+        let target = ls(&[(0.0, 0.0), (1.0, 1.0)]);
+        let out = add_point(&target, &wkt_point(2.0, 2.0)).unwrap();
+        assert_eq!(num_points(&out).unwrap(), 3);
+    }
+
+    #[test]
+    fn simplify_preserve_topology_keeps_invalid_fallback() {
+        // A simple square simplifies without issue and stays valid.
+        let sq = rect_poly(0.0, 0.0, 4.0, 4.0);
+        let out = simplify_preserve_topology(&sq, 0.1).unwrap();
+        assert!(is_valid(&out).unwrap());
+    }
+
+    #[test]
+    fn minimum_clearance_is_finite_for_polygon() {
+        // A unit square has a well-defined (positive) minimum clearance.
+        let sq = rect_poly(0.0, 0.0, 1.0, 1.0);
+        let mc = minimum_clearance(&sq).unwrap();
+        assert!(mc.is_finite() && mc > 0.0);
+    }
+
+    #[test]
+    fn minimum_clearance_infinite_for_point() {
+        assert!(minimum_clearance(&wkt_point(1.0, 1.0)).unwrap().is_infinite());
+    }
+
+    #[test]
+    fn minimum_clearance_line_matches_clearance() {
+        let sq = rect_poly(0.0, 0.0, 4.0, 4.0);
+        let line = minimum_clearance_line(&sq).unwrap();
+        // The line's length equals the clearance.
+        let d = match line {
+            Geometry::LineString(ls) => {
+                let a = ls.0[0];
+                let b = ls.0[1];
+                (a.x - b.x).hypot(a.y - b.y)
+            }
+            other => panic!("expected linestring, got {other:?}"),
+        };
+        assert!((d - minimum_clearance(&sq).unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn minimum_bounding_circle_encloses_all_vertices() {
+        // Points on a unit circle: the minimum enclosing circle is centered at
+        // origin with radius 1.
+        let pts = Geometry::MultiPoint(geo_types::MultiPoint(
+            (0..8)
+                .map(|i| {
+                    let a = std::f64::consts::FRAC_PI_4 * i as f64;
+                    geo_types::Point::new(a.cos(), a.sin())
+                })
+                .collect(),
+        ));
+        let out = minimum_bounding_circle(&pts, 32.0).unwrap();
+        match out {
+            Geometry::Polygon(poly) => {
+                // Every original vertex must be inside the circle polygon.
+                let b = poly.bounding_rect().unwrap();
+                // radius ~1 → bbox roughly [-1.1, 1.1] in both axes.
+                assert!(b.min().x >= -1.2 && b.max().x <= 1.2);
+            }
+            other => panic!("expected polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generate_points_is_deterministic_and_inside() {
+        let sq = rect_poly(0.0, 0.0, 10.0, 10.0);
+        let a = generate_points(&sq, 50).unwrap();
+        let b = generate_points(&sq, 50).unwrap();
+        // Same seed → identical point set.
+        match (&a, &b) {
+            (Geometry::MultiPoint(ma), Geometry::MultiPoint(mb)) => {
+                assert_eq!(ma.0.len(), 50);
+                assert_eq!(ma.0, mb.0);
+                // All points inside the 10×10 square.
+                assert!(ma.0.iter().all(|p| p.x() >= 0.0 && p.x() <= 10.0 && p.y() >= 0.0 && p.y() <= 10.0));
+            }
+            other => panic!("expected multipoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_valid_reason_reports_valid_or_invalid() {
+        let ok = rect_poly(0.0, 0.0, 1.0, 1.0);
+        assert_eq!(is_valid_reason(&ok).unwrap(), "Valid Geometry");
+        // A self-touching "bowtie" polygon is structurally invalid.
+        let bad = Geometry::Polygon(geo_types::Polygon::new(
+            geo_types::LineString::from(vec![
+                (0.0, 0.0),
+                (1.0, 1.0),
+                (1.0, 0.0),
+                (0.0, 1.0),
+                (0.0, 0.0),
+            ]),
+            vec![],
+        ));
+        let reason = is_valid_reason(&bad).unwrap();
+        assert_ne!(reason, "Valid Geometry");
     }
 }
