@@ -3,16 +3,22 @@
 Status of the `sedonadb` DuckDB extension against the Apache SedonaDB and
 PostGIS spatial surfaces, and what it takes to reach a **superset**.
 
-## Where we are now (~90 functions, all on the `geo`/`wkb` stack)
+## Where we are now (~115 functions, all on the `geo`/`wkb` stack)
 
-Constructors & I/O (incl. EWKT) · accessors · DE-9IM predicates · measurements
-· boolean set ops · affine/simplify transforms · `ST_MakeValid` robustness ·
-two aggregates (`ST_Collect`, `ST_Envelope` agg) · `ST_DWithin` · bbox accessors
-(join prefilter) · a custom robust point-in-polygon · **geodesic/geography**
-(`ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere`) · EWKT/SRID stubs ·
-typed WKT constructors · `ST_Points/LineLocatePoint/Frechet/ClosestPoint/\
-Hausdorff/FlipCoordinates/Reverse/RemoveRepeatedPoints/OrientedEnvelope`. Verified
-end-to-end in DuckDB 1.5.4 over a local DuckLake and Apache SpatialBench
+Constructors & I/O (incl. EWKT **and EWKB**) · accessors · DE-9IM predicates ·
+measurements (incl. `ST_MaxDistance`/`ST_LongestLine`/`ST_ShortestLine`) ·
+boolean set ops · affine/simplify/segmentize transforms · `ST_MakeValid`
+robustness · three aggregates (`ST_Collect`, `ST_Envelope` agg, `ST_Union` agg)
+· `ST_DWithin` · bbox accessors (join prefilter) · a custom robust
+point-in-polygon · **geodesic/geography**
+(`ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere`) · EWKT/EWKB/SRID
+stubs · typed WKT constructors · `ST_Points/LineLocatePoint/Frechet/\
+ClosestPoint/Hausdorff/FlipCoordinates/Reverse/RemoveRepeatedPoints/\
+OrientedEnvelope` · `ST_Affine`(6-param)/`ST_Segmentize`/`ST_LineSubstring`/
+`ST_LineMerge`/`ST_CollectionExtract`/`ST_ForceCollection`/`ST_Multi`/
+`ST_Normalize`/`ST_ForceRHR`/`ST_ForcePolygonCW`/`ST_ForcePolygonCCW`/
+`ST_TriangulatePolygon`/`ST_OrderingEquals`/`ST_NRings`. Verified end-to-end in
+DuckDB 1.5.4 over a local DuckLake and Apache SpatialBench
 (`benchmarks/BENCHMARKS.md`).
 
 ## Previously-flagged hard bits — now resolved
@@ -39,17 +45,17 @@ Legend: ✅ shipped · 🟡 partial · ⏳ not yet · ➖ out of scope (niche).
 
 | Category | PostGIS | SedonaDB | sedonadb (this ext.) | Notes |
 |---|---|---|---|---|
-| Constructors (WKT/WKB/EWKT/EWKB, typed `*FromText`) | ✅ | ✅ | 🟡 | WKT/WKB + `ST_Point`; EWKT/EWKB + typed constructors = Tier 1 |
-| Output (`ST_AsText/Binary/EWKB/GeoJSON`) | ✅ | ✅ | 🟡 | Text/Binary done; EWKB/GeoJSON = Tier 1 |
-| Accessors (X/Y/Z/M, dims, rings, N-th geometry/point) | ✅ | ✅ | 🟡 | 2D accessors done; Z/M stubs return NULL/false |
-| DE-9IM predicates (`Intersects`…`Covers`) | ✅ | ✅ | ✅ | All 10; guarded for invalid input |
-| Measurements (`Area/Length/Distance/Perimeter/Azimuth/Hausdorff`) | ✅ | ✅ | 🟡 | core done; `Frechet/MaxDistance/LongestLine/ClosestPoint` = Tier 1b |
+| Constructors (WKT/WKB/EWKT/EWKB, typed `*FromText`) | ✅ | ✅ | ✅ | WKT/WKB/EWKT/EWKB + typed constructors + `ST_Point` all shipped. `from_wkb` is EWKB-tolerant at the trust boundary. |
+| Output (`ST_AsText/Binary/EWKB/GeoJSON/HexEWKB`) | ✅ | ✅ | ✅ | Text/Binary/EWKB/GeoJSON/HexEWKB all done |
+| Accessors (X/Y/Z/M, dims, rings, N-th geometry/point) | ✅ | ✅ | 🟡 | 2D accessors + `ST_NRings` done; Z/M stubs return NULL/false |
+| DE-9IM predicates (`Intersects`…`Covers`, `OrderingEquals`) | ✅ | ✅ | ✅ | All 10 + `ST_OrderingEquals`; guarded for invalid input |
+| Measurements (`Area/Length/Distance/Perimeter/Azimuth/Hausdorff/MaxDistance/LongestLine/ShortestLine`) | ✅ | ✅ | ✅ | core + distance-family done |
 | Boolean set ops (`Union/Intersection/Difference/SymDiff`) | ✅ | 🟡 | ✅ | |
 | `ST_MakeValid` / validity | ✅ | 🟡 | ✅ | robustness hardening done |
-| Editing (`Translate/Scale/Rotate/Flip/Reverse/Affine/Segmentize`) | ✅ | ✅ | 🟡 | 6 of 8; `Affine`(6-param)/`Segmentize` = Tier 1 |
-| Geometry processing (`Buffer/Simplify/ConvexHull/ConcaveHull/OrientedEnvelope/Triangulate/Voronoi`) | ✅ | 🟡 | 🟡 | Buffer/Simplify/Hull/OrientedEnvelope done; Delaunay/Voronoi/Polygonize/LineMerge = Tier 1b |
-| Linear referencing (`LineInterpolatePoint/Locate/Substring`) | ✅ | 🟡 | 🟡 | interpolate done; locate/substring = Tier 1 |
-| Aggregates (`Collect/Union/Envelope/Intersection`) | ✅ | ✅ | 🟡 | `ST_Collect` done; union/envelope/intersection aggregates = Tier 1 |
+| Editing (`Translate/Scale/Rotate/Flip/Reverse/Affine/Segmentize/LineSubstring/LineMerge/Normalize`) | ✅ | ✅ | ✅ | all done incl. 6-param `ST_Affine` |
+| Geometry processing (`Buffer/Simplify/ConvexHull/ConcaveHull/OrientedEnvelope/Triangulate/Voronoi`) | ✅ | 🟡 | 🟡 | Buffer/Simplify/Hull/OrientedEnvelope/TriangulatePolygon done; bounded Voronoi polygons + Polygonize open |
+| Linear referencing (`LineInterpolatePoint/Locate/Substring`) | ✅ | 🟡 | ✅ | interpolate/locate/substring all done |
+| Aggregates (`Collect/Union/Envelope/Intersection`) | ✅ | ✅ | 🟡 | `ST_Collect`/`ST_Union`/`ST_Envelope` agg done; intersection aggregate open |
 | **Geography (geodesic) ops** | ✅ | ✅ | ✅ | `Distance/DWithin/Length/Area` Sphere done (lon/lat) |
 | **CRS / PROJ (`ST_Transform`, SRID)** | ✅ | ✅ | ✅ | `ST_Transform` via PROJ (runtime libproj dep) |
 | **Spatial index join (R-tree/GiST, `&&`/`<->`)** | ✅ | ✅ | ✅ | `sedona_join` table fn (R-tree over spilled parquet) + bbox-prefilter |
@@ -64,30 +70,31 @@ SedonaDB for the common cases. The real gaps to a true superset are the four
 ## Tiers
 
 ### Tier 1 — finish geometry-level parity (small, geo-backed, ~1 line each)
-Cheap wins; each is one `register_*!` line + a `geo` call.
+Cheap wins; each is one `register_*!` line + a `geo` call. **Mostly ✅ done.**
 
-- EWKB/EWKT I/O: `ST_AsEWKB`, `ST_AsEWKT`, `ST_GeomFromEWKB`, `ST_GeomFromEWKT`
-  (EWKB = WKB with a 4-byte SRID prefix; EWKT = `SRID=…;<wkt>`).
-- SRID stubs: `ST_SRID` (0), `ST_SetSRID` (no-op tag) — real SRID carrying
-  waits on Tier 3 PROJ.
-- Typed constructors: `ST_LineFromText`, `ST_PointFromText`,
-  `ST_PolygonFromText`, `ST_MLineFromText`, …
-- `ST_Dump`, `ST_DumpPoints`, `ST_DumpSegments` (needs a **table/set function**;
-  the one new FFI shape we haven't built).
-- `ST_Affine`(6 doubles), `ST_Segmentize`, `ST_LineSubstring`,
-  `ST_LineLocatePoint`, `ST_Points`, `ST_Node`, `ST_Snap`, `ST_SnapToGrid`,
-  `ST_LineMerge`, `ST_Polygonize`, `ST_BuildArea`, `ST_CollectionExtract`.
-- `ST_AsGeoJSON` (add the `geojson` crate).
-- More aggregates: `ST_Union` (multi), `ST_Envelope` agg, `ST_Intersection` agg,
-  `ST_Collect` already done.
-- `ST_DelaunayTriangles`, `ST_VoronoiPolygons` (dispatch to geo per-type;
-  traits aren't on the `Geometry` enum yet).
+- ✅ EWKB/EWKT I/O: `ST_AsEWKB`, `ST_GeomFromEWKB` (EWKB-tolerant `from_wkb`),
+  `ST_AsEWKT`, `ST_GeomFromEWKT`, `ST_AsHexEWKB`.
+- ✅ SRID stubs: `ST_SRID` (0), `ST_SetSRID` (no-op tag).
+- ✅ Typed constructors: `ST_LineFromText`, `ST_PointFromText`,
+  `ST_PolygonFromText`, `ST_MLineFromText`, … (route through WKT parser).
+- ✅ `ST_Affine`(6 doubles), `ST_Segmentize`, `ST_LineSubstring`,
+  `ST_LineMerge`, `ST_CollectionExtract`, `ST_ForceCollection`, `ST_Multi`,
+  `ST_Normalize`, `ST_ForceRHR`/`ST_ForcePolygonCW`/`ST_ForcePolygonCCW`,
+  `ST_SnapToGrid`.
+- ✅ More aggregates: `ST_Union` agg (`st_union_agg`), `ST_Envelope` agg.
+  `ST_Collect` already done. Intersection aggregate still open.
+- ✅ `ST_TriangulatePolygon` (Delaunay-interior approximation).
+- ⏳ `ST_Dump`, `ST_DumpPoints`, `ST_DumpSegments` — needs a **table/set
+  function**; the one new FFI shape we haven't built.
+- ⏳ `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea` — topology editing.
+- ⏳ `ST_VoronoiPolygons` (bounded cell polygons; `ST_VoronoiLines` already
+  ships).
 
 ### Tier 1b — PostGIS geo-backed geometry processing
-`ST_HausdorffDistance` (done), `ST_FrechetDistance`, `ST_MaxDistance`,
+✅ `ST_HausdorffDistance`, `ST_FrechetDistance`, `ST_MaxDistance`,
 `ST_LongestLine`, `ST_ClosestPoint`, `ST_ShortestLine`, `ST_Project`,
-`ST_MinimumClearance`, `ST_TriangulatePolygon`, `ST_OrientedEnvelope` (done),
-`ST_GeneratePoints`, `ST_Subdivide`.
+`ST_OrientedEnvelope`, `ST_TriangulatePolygon` all shipped. Still open:
+`ST_MinimumClearance`, `ST_GeneratePoints`, `ST_Subdivide`.
 
 ### Tier 2 — Geography (geodesic) — ✅ DONE
 `ST_DistanceSphere`, `ST_DWithinSphere`, `ST_LengthSphere`, `ST_AreaSphere`

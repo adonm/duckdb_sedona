@@ -40,15 +40,64 @@ impl core::fmt::Display for GeometryError {
 
 impl std::error::Error for GeometryError {}
 
-/// Parse a WKB byte slice into an owned [`Geom`].
+/// Parse a WKB (or EWKB) byte slice into an owned [`Geom`].
 ///
 /// Returns an error for truncated / malformed WKB or for geometries that
 /// `geo-types` cannot represent (see the module docs).
+///
+/// **EWKB tolerance:** EWKB is WKB with an optional SRID flag (`0x20000000`) in
+/// the type word and, when set, a 4-byte SRID after the type word. The `wkb`
+/// crate reader does not understand that flag, so this entry point strips it
+/// from the *top-level* geometry before parsing (children never carry it). This
+/// keeps every ST_* function robust to EWKB input (which DuckDB's own `spatial`
+/// extension produces) without changing behaviour for plain WKB. The SRID
+/// itself is discarded: this extension carries no SRID in its `Geom` type.
 pub fn from_wkb(bytes: &[u8]) -> Result<Geom, GeometryError> {
-    let wkb = read_wkb(bytes).map_err(|_| GeometryError("invalid or truncated WKB"))?;
+    let normalized = strip_ewkb_srid(bytes);
+    let wkb = read_wkb(&normalized).map_err(|_| GeometryError("invalid or truncated WKB"))?;
     to_geometry(&wkb).ok_or(GeometryError(
         "unsupported geometry (e.g. POINT EMPTY or nested GEOMETRYCOLLECTION)",
     ))
+}
+
+/// If `bytes` is little- or big-endian EWKB whose top-level geometry type
+/// carries the SRID flag, return an owned slice with the flag cleared and the
+/// 4 SRID bytes removed. Otherwise return a borrow of the input unchanged.
+/// Owned output is dropped by the caller, so there is no leak.
+fn strip_ewkb_srid(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    // EWKB layout: [endian:1][type:4][optional srid:4][coords...].
+    if bytes.len() < 5 {
+        return Cow::Borrowed(bytes);
+    }
+    let little = bytes[0] == 1;
+    let type_bytes: [u8; 4] = match bytes[1..5].try_into() {
+        Ok(b) => b,
+        Err(_) => return Cow::Borrowed(bytes),
+    };
+    let type_word = if little {
+        u32::from_le_bytes(type_bytes)
+    } else {
+        u32::from_be_bytes(type_bytes)
+    };
+    const SRID_FLAG: u32 = 0x2000_0000;
+    if type_word & SRID_FLAG == 0 {
+        return Cow::Borrowed(bytes);
+    }
+    // Strip the flag and drop the 4 SRID bytes after the type word.
+    let cleared = type_word & !SRID_FLAG;
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len().saturating_sub(4));
+    out.push(bytes[0]);
+    out.extend_from_slice(&if little {
+        cleared.to_le_bytes()
+    } else {
+        cleared.to_be_bytes()
+    });
+    if bytes.len() >= 9 {
+        // bytes[5..9] is the SRID we drop; bytes[9..] is the coordinate payload.
+        out.extend_from_slice(&bytes[9..]);
+    }
+    Cow::Owned(out)
 }
 
 /// Serialize a [`Geom`] back to little-endian ISO WKB.
@@ -139,5 +188,36 @@ mod tests {
     fn rejects_garbage() {
         assert!(from_wkb(&[0u8; 3]).is_err());
         assert!(from_wkb(&[]).is_err());
+    }
+
+    // EWKB for POINT(1 2) with SRID=4326, little-endian. Type word = 0x2000_0001.
+    const POINT_EWKB_SRID: [u8; 25] = [
+        0x01,                                   // little-endian
+        0x01, 0x00, 0x00, 0x20,                 // type = 0x20000001 (Point + SRID flag)
+        0xe0, 0x01, 0x00, 0x00,                 // SRID = 4326 (LE)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, // x = 1.0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // y = 2.0
+    ];
+
+    #[test]
+    fn parses_ewkb_with_srid() {
+        // The extension is SRID-less in Geom, but must accept EWKB input by
+        // stripping the top-level SRID flag + value.
+        let g = from_wkb(&POINT_EWKB_SRID).expect("parse EWKB POINT");
+        match g {
+            Geometry::Point(p) => {
+                assert!((p.x() - 1.0).abs() < f64::EPSILON);
+                assert!((p.y() - 2.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Point, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_wkb_unchanged_by_ewkb_strip() {
+        // Plain WKB (no SRID flag) must round-trip identically.
+        let g = from_wkb(&POINT_WKB).expect("parse POINT");
+        let bytes = to_wkb(&g).expect("serialize POINT");
+        assert_eq!(bytes, POINT_WKB);
     }
 }

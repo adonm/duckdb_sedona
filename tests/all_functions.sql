@@ -64,6 +64,29 @@ SELECT CASE WHEN st_astext(st_boundary(st_geomfromtext('LINESTRING(0 0,1 1,2 2)'
 -- === Aggregates ===
 SELECT CASE WHEN st_numgeometries(st_collect(g)) = 3 THEN 'PASS' ELSE 'FAIL collect' FROM (SELECT st_point(0,0) g UNION ALL SELECT st_point(1,1) UNION ALL SELECT st_point(2,2));
 SELECT CASE WHEN st_astext(st_envelope_agg(g)) = 'POLYGON((0 0,5 0,5 8,0 8,0 0))' THEN 'PASS' ELSE 'FAIL envelope_agg' FROM (SELECT st_point(0,0) g UNION ALL SELECT st_point(5,2) UNION ALL SELECT st_point(2,8));
+SELECT CASE WHEN st_area(st_union_agg(g)) = 2.0 THEN 'PASS' ELSE 'FAIL union_agg' FROM (SELECT st_geomfromtext('POLYGON((0 0,1 0,1 1,0 1,0 0))') g UNION ALL SELECT st_geomfromtext('POLYGON((1 0,2 0,2 1,1 1,1 0))'));
 
 -- === Raster ===
 SELECT CASE WHEN count = 16 THEN 'PASS' ELSE 'FAIL raster_stats' FROM st_raster_stats('/var/home/adonm/dev/duckdb_sedona/build/raster/test.tif', 1);
+
+-- === Tier 1/1b parity batch (editing, transforms, measurements, I/O) ===
+SELECT CASE WHEN st_astext(st_affine(st_point(1,2),1,0,0,1,5,5)) = 'POINT(6 7)' THEN 'PASS' ELSE 'FAIL affine' END;
+SELECT CASE WHEN st_numpoints(st_segmentize(st_geomfromtext('LINESTRING(0 0,10 0)'),4.0)) = 4 THEN 'PASS' ELSE 'FAIL segmentize' END;
+SELECT CASE WHEN round(st_length(st_linesubstring(st_geomfromtext('LINESTRING(0 0,10 0)'),0.25,0.75)),4) = 5.0 THEN 'PASS' ELSE 'FAIL linesubstring' END;
+SELECT CASE WHEN st_numgeometries(st_linemerge(st_geomfromtext('MULTILINESTRING((0 0,1 0),(1 0,2 0))'))) = 1 THEN 'PASS' ELSE 'FAIL linemerge' END;
+SELECT CASE WHEN st_numgeometries(st_collectionextract(st_geomfromtext('GEOMETRYCOLLECTION(POLYGON((0 0,1 0,1 1,0 0)),POINT(2 2))'),3)) = 1 THEN 'PASS' ELSE 'FAIL collectionextract' END;
+SELECT CASE WHEN st_numgeometries(st_forcecollection(st_point(1,1))) = 1 THEN 'PASS' ELSE 'FAIL forcecollection' END;
+SELECT CASE WHEN st_geometrytype(st_multi(st_point(1,1))) = 'ST_MultiPoint' THEN 'PASS' ELSE 'FAIL multi' END;
+SELECT CASE WHEN round(st_maxdistance(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 0))'),st_geomfromtext('POLYGON((4 4,5 4,5 5,4 5,4 4))')),4) = round(sqrt(50.0),4) THEN 'PASS' ELSE 'FAIL maxdistance' END;
+SELECT CASE WHEN round(st_length(st_longestline(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 0))'),st_geomfromtext('POLYGON((4 4,5 4,5 5,4 5,4 4))'))),4) = round(sqrt(50.0),4) THEN 'PASS' ELSE 'FAIL longestline' END;
+SELECT CASE WHEN st_astext(st_shortestline(st_point(1,1),st_geomfromtext('LINESTRING(0 0,2 0)'))) = 'LINESTRING(1 1,1 0)' THEN 'PASS' ELSE 'FAIL shortestline' END;
+SELECT CASE WHEN st_nrings(st_geomfromtext('POLYGON((0 0,10 0,10 10,0 10,0 0),(2 2,4 2,4 4,2 4,2 2))')) = 2 THEN 'PASS' ELSE 'FAIL nrings' END;
+SELECT CASE WHEN st_numinteriorring(st_geomfromtext('POLYGON((0 0,10 0,10 10,0 10,0 0),(2 2,4 2,4 4,2 4,2 2))')) = 1 THEN 'PASS' ELSE 'FAIL numinteriorring' END;
+SELECT CASE WHEN st_orderingequals(st_point(1,1), st_point(1,1)) = true THEN 'PASS' ELSE 'FAIL orderingequals' END;
+SELECT CASE WHEN st_ispolygon(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 0))')) = true THEN 'PASS' ELSE 'FAIL ispolygon' END;
+SELECT CASE WHEN st_ispoint(st_point(1,1)) = true THEN 'PASS' ELSE 'FAIL ispoint' END;
+SELECT CASE WHEN st_islinestring(st_geomfromtext('LINESTRING(0 0,1 1)')) = true THEN 'PASS' ELSE 'FAIL islinestring' END;
+SELECT CASE WHEN st_asewkb(st_point(1,2)) IS NOT NULL THEN 'PASS' ELSE 'FAIL asewkb' END;
+SELECT CASE WHEN st_astext(st_geomfromewkb(st_asewkb(st_point(1,2)))) = 'POINT(1 2)' THEN 'PASS' ELSE 'FAIL geomfromewkb' END;
+SELECT CASE WHEN length(st_ashexewkb(st_point(1,2))) = 42 THEN 'PASS' ELSE 'FAIL ashexewkb' END;
+SELECT CASE WHEN abs(st_area(st_triangulatepolygon(st_geomfromtext('POLYGON((0 0,2 0,2 2,0 2,0 0))'))) - 4.0) < 0.0001 THEN 'PASS' ELSE 'FAIL triangulatepolygon' END;

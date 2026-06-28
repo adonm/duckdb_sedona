@@ -24,7 +24,7 @@
 // (e.g. any coordinate whose IEEE-754 bytes form an invalid UTF-8 sequence).
 // We parse the 16-byte `duckdb_string_t` ourselves to get the raw bytes.
 
-use geo_types::Geometry;
+use geo_types::{Geometry, MultiPolygon};
 use libduckdb_sys::{
     duckdb_aggregate_state, duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
     duckdb_function_info, duckdb_vector, duckdb_vector_get_data, duckdb_vector_get_validity,
@@ -419,6 +419,45 @@ where
     }
 }
 
+/// Vectorized executor for `(geometry, DOUBLE×6) -> geometry` transforms
+/// (`ST_Affine` 2D: a, b, d, e, xoff, yoff).
+pub fn geom_double6_to_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
+where
+    F: Fn(&Geom, f64, f64, f64, f64, f64, f64) -> Option<Geom>,
+{
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let geom = unsafe { BlobCol::new(chunk.as_raw(), 0) };
+    let s = [
+        unsafe { VectorReader::new(chunk.as_raw(), 1) },
+        unsafe { VectorReader::new(chunk.as_raw(), 2) },
+        unsafe { VectorReader::new(chunk.as_raw(), 3) },
+        unsafe { VectorReader::new(chunk.as_raw(), 4) },
+        unsafe { VectorReader::new(chunk.as_raw(), 5) },
+        unsafe { VectorReader::new(chunk.as_raw(), 6) },
+    ];
+    let mut writer = unsafe { VectorWriter::new(output) };
+
+    for row in 0..geom.n {
+        let Some(g) = read_geom(&geom, row) else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        let vals: Option<[f64; 6]> = s
+            .iter()
+            .map(|r| read_f64(r, row))
+            .collect::<Option<Vec<_>>>()
+            .map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]]);
+        let Some([a, b, c, d, e, ff]) = vals else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        match f(&g, a, b, c, d, e, ff).and_then(|out| geometry::to_wkb(&out).ok()) {
+            Some(bytes) => unsafe { writer.write_blob(row, &bytes) },
+            None => unsafe { writer.set_null(row) },
+        }
+    }
+}
+
 /// Vectorized executor for `(DOUBLE, DOUBLE) -> geometry` constructors (`ST_Point`).
 pub fn doubles2_to_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
 where
@@ -701,4 +740,118 @@ pub unsafe extern "C" fn envelope_finalize(
 }
 pub unsafe extern "C" fn envelope_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
     unsafe { FfiState::<EnvelopeAggState>::destroy_callback(states, count) };
+}
+
+// ---------------------------------------------------------------------------
+// ST_Union aggregate (cascaded polygonal union)
+// ---------------------------------------------------------------------------
+
+/// Per-group state for `ST_Union`: the polygonal parts seen so far, unioned
+/// pairwise as they arrive (cascaded). The result is a single MultiPolygon.
+#[derive(Default)]
+pub struct UnionAggState {
+    /// Carried union of polygonal parts; `None` until the first polygonal geom.
+    pub acc: Option<MultiPolygon>,
+}
+impl AggregateState for UnionAggState {}
+
+/// Reduce a geometry to its polygonal part (for boolean union). Non-polygonal
+/// geometries contribute nothing (consistent with the scalar `ST_Union`).
+fn polygonal_part(g: &Geom) -> MultiPolygon {
+    use geo_types::Polygon;
+    fn collect(g: &Geom, polys: &mut Vec<Polygon>) {
+        match g {
+            Geometry::Polygon(p) => polys.push(p.clone()),
+            Geometry::MultiPolygon(mp) => polys.extend(mp.0.iter().cloned()),
+            Geometry::GeometryCollection(c) => {
+                for item in &c.0 {
+                    collect(item, polys);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut polys = Vec::new();
+    collect(g, &mut polys);
+    MultiPolygon::new(polys)
+}
+
+pub unsafe extern "C" fn union_state_size(info: duckdb_function_info) -> idx_t {
+    unsafe { FfiState::<UnionAggState>::size_callback(info) }
+}
+pub unsafe extern "C" fn union_state_init(info: duckdb_function_info, state: duckdb_aggregate_state) {
+    unsafe { FfiState::<UnionAggState>::init_callback(info, state) };
+}
+pub unsafe extern "C" fn union_update(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+) {
+    use geo::algorithm::bool_ops::BooleanOps;
+    let col = unsafe { BlobCol::new(input, 0) };
+    for row in 0..col.n {
+        let Some(g) = read_geom(&col, row) else { continue };
+        // SAFETY: `states` has one entry per input row.
+        let state_ptr = unsafe { *states.add(row) };
+        let Some(st) = (unsafe { FfiState::<UnionAggState>::with_state_mut(state_ptr) }) else { continue };
+        let part = polygonal_part(&g);
+        if part.0.is_empty() {
+            continue;
+        }
+        st.acc = Some(match st.acc.take() {
+            Some(acc) => acc.union(&part),
+            None => part,
+        });
+    }
+}
+pub unsafe extern "C" fn union_combine(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: idx_t,
+) {
+    use geo::algorithm::bool_ops::BooleanOps;
+    for i in 0..count as usize {
+        let src_ptr = unsafe { *source.add(i) };
+        let tgt_ptr = unsafe { *target.add(i) };
+        let (src, tgt) = unsafe {
+            (
+                FfiState::<UnionAggState>::with_state(src_ptr),
+                FfiState::<UnionAggState>::with_state_mut(tgt_ptr),
+            )
+        };
+        if let (Some(s), Some(t)) = (src, tgt) {
+            match (s.acc.clone(), t.acc.take()) {
+                (Some(ss), Some(ts)) => t.acc = Some(ts.union(&ss)),
+                (Some(ss), None) => t.acc = Some(ss),
+                (None, ts) => t.acc = ts,
+            }
+        }
+    }
+}
+pub unsafe extern "C" fn union_finalize(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+) {
+    let mut writer = unsafe { VectorWriter::new(result) };
+    for i in 0..count as usize {
+        let out_row = offset as usize + i;
+        let state_ptr = unsafe { *source.add(i) };
+        match unsafe { FfiState::<UnionAggState>::with_state(state_ptr) } {
+            Some(st) if st.acc.is_some() => {
+                let out = Geometry::MultiPolygon(st.acc.clone().unwrap());
+                match geometry::to_wkb(&out) {
+                    Ok(b) => unsafe { writer.write_blob(out_row, &b) },
+                    Err(_) => unsafe { writer.set_null(out_row) },
+                }
+            }
+            _ => unsafe { writer.set_null(out_row) },
+        }
+    }
+}
+pub unsafe extern "C" fn union_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
+    unsafe { FfiState::<UnionAggState>::destroy_callback(states, count) };
 }

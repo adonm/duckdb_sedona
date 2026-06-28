@@ -85,15 +85,16 @@ dispatch + declarative macro registry, low-maintenance single-line registration
 
 All functions take **BLOB** (ISO WKB) arguments. Geometry-returning functions
 return **BLOB** (ISO WKB). `NULL` in → `NULL` out; an input that fails to parse
-or an operation that is undefined for the input also yields `NULL`. **~90
+or an operation that is undefined for the input also yields `NULL`. **~115
 functions** across constructors, accessors, predicates, measurements, set ops,
-transforms, validity, two aggregates (`st_collect`, `st_envelope_agg`),
-**geodesic/geography** (`st_distancesphere`…), EWKT/SRID, and I/O.
+transforms, validity, three aggregates (`st_collect`, `st_envelope_agg`,
+`st_union_agg`), **geodesic/geography** (`st_distancesphere`…), EWKT/EWKB/SRID,
+affine & segmentize transforms, line editing, and I/O.
 
 See **[ROADMAP.md](./ROADMAP.md)** for a category-level capability matrix vs
 SedonaDB and PostGIS and the tiered plan to reach a superset (next up:
-EWKB/EWKT I/O, typed constructors, `ST_Dump`, geography/geodesic variants,
-`ST_Transform`/PROJ, and an R-tree spatial-join table function).
+`ST_Dump` as a set-returning table function, bounded `ST_VoronoiPolygons`, and
+a DuckDB-chunk ⇄ Arrow bridge to the real SedonaDB DataFusion UDFs).
 
 | SQL function | Signature | Backed by |
 | --- | --- | --- |
@@ -126,6 +127,20 @@ EWKB/EWKT I/O, typed constructors, `ST_Dump`, geography/geodesic variants,
 | `st_makevalid` | `(BLOB) → BLOB` | `buffer(0)` topology repair |
 | `st_geometrytype` | `(BLOB) → VARCHAR` | variant match |
 | `st_dimension` | `(BLOB) → INTEGER` | OGC dimension |
+| `st_affine` | `(BLOB, DOUBLE×6) → BLOB` | 2D affine matrix |
+| `st_segmentize` | `(BLOB, DOUBLE) → BLOB` | split long segments |
+| `st_linesubstring` | `(BLOB, DOUBLE, DOUBLE) → BLOB` | line slice by fraction |
+| `st_linemerge` | `(BLOB) → BLOB` | chain touching linestrings |
+| `st_collectionextract` | `(BLOB, INTEGER) → BLOB` | filter collection by dim |
+| `st_forcecollection` | `(BLOB) → BLOB` | wrap in GeometryCollection |
+| `st_multi` | `(BLOB) → BLOB` | promote to multi type |
+| `st_normalize` | `(BLOB) → BLOB` | canonical vertex order |
+| `st_triangulatepolygon` | `(BLOB) → BLOB` | Delaunay interior triangulation |
+| `st_maxdistance` | `(BLOB, BLOB) → DOUBLE` | greatest vertex-vertex distance |
+| `st_longestline` | `(BLOB, BLOB) → BLOB` | line realizing max distance |
+| `st_shortestline` | `(BLOB, BLOB) → BLOB` | line realizing min distance |
+| `st_orderingequals` | `(BLOB, BLOB) → BOOLEAN` | structural (coord-order) equality |
+| `st_union_agg` | `(BLOB) → BLOB` (aggregate) | cascaded polygonal union |
 
 ### Adding a function
 
@@ -295,14 +310,14 @@ What the brief's "Future work" section asked for, and where it stands:
 
 | Item | Status |
 | --- | --- |
-| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — ~50 functions now, incl. DE-9IM predicates, transforms, `ST_Collect` aggregate |
+| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — ~115 functions now, incl. DE-9IM predicates, transforms, affine/segmentize/line editing, `ST_TriangulatePolygon`, `ST_Collect`/`ST_Union`/`ST_Envelope` aggregates |
 | **Robustness on real-world (invalid / over-complex) polygons** | ✅ Done — `ST_MakeValid` + an internal `ensure_valid` guard across all relate/boolean ops, plus a custom iterative ray-cast PIP for `ST_Within`/`ST_Contains` (so 100k+ vertex polygons no longer crash). See `benchmarks/BENCHMARKS.md`. |
 | **Spatial joins at scale** | ✅ Done — two paths: (1) `sedona_join(a.parquet, b.parquet, predicate)` R*-tree table function over spilled parquet (the disk-spill model); (2) inline bbox-prefilter (`ST_XMin/Max/YMin/MaxY` + DuckDB IEJoin). |
 | **Geography (geodesic)** | ✅ Done — `ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere` (lon/lat → metres/m²). |
 | **CRS / PROJ (`ST_Transform`)** | ✅ Done — `ST_Transform(geom, from_srid, to_srid)` via PROJ. Runtime dep: `libproj.so`. |
 | **Non-flat (dictionary/sequence) input vectors** | ⏳ Open — an `ORDER BY … LIMIT` on a geometry column feeding a scalar fn segfaults (DuckDB C API exposes no vector-encoding inspection; `BlobCol` can't decode it). Workaround: materialize/filter. See BENCHMARKS "Known limitations". |
 | **Bridge to real Apache SedonaDB DataFusion UDFs** (`sedona-functions::default_function_set`) | ⏳ Open — would need a DuckDB-chunk ⇄ Arrow bridge. |
-| **Raster / map algebra**, **3D Z/M + SFCGAL**, `ST_VoronoiPolygons`, topology | ✅ Raster core (vendored GDAL: `st_raster_info`/`st_raster_stats`) + `ST_DelaunayTriangles`/`ST_VoronoiLines` done. Map-algebra/`ST_AsRaster`/bounded Voronoi polygons open. 3D/SFCGAL has no mature Rust binding (out of reach); topology is niche. Static PROJ now bundled. |
+| **Raster / map algebra**, **3D Z/M + SFCGAL**, `ST_VoronoiPolygons`, topology | ✅ Raster core (vendored GDAL: `st_raster_info`/`st_raster_stats`) + `ST_DelaunayTriangles`/`ST_VoronoiLines`/`ST_TriangulatePolygon` done. Map-algebra/`ST_AsRaster`/bounded Voronoi polygons open. 3D/SFCGAL has no mature Rust binding (out of reach); topology is niche. Static PROJ now bundled. |
 
 These map onto the brief's dependency table: the DuckDB interface stays stable
 through the C-API, while SedonaDB remains a plain `cargo update`.

@@ -1149,6 +1149,703 @@ pub fn transform(g: &Geom, from_srid: i32, to_srid: i32) -> Option<Geom> {
     })
 }
 
+// =====================================================================
+// Tier 1 / 1b parity batch
+//
+// These functions close the geometry-level gaps flagged in ROADMAP.md:
+// affine & segmentize transforms, line substring / merge, collection
+// editing, force-orientation/normalization, distance-based measurements,
+// polygon triangulation, structural accessors, type predicates, and
+// EWKB/hex I/O. Each follows the same `fn(&Geom[, &Geom][, scalar])* ->
+// Option<...>` shape the generic executors expect.
+// =====================================================================
+
+// ----- editing transforms -----------------------------------------------
+
+/// `ST_Affine(geom, a, b, d, e, xoff, yoff)` — 2D affine transform:
+/// `x' = a*x + d*y + xoff`, `y' = b*x + e*y + yoff`.
+///
+/// Parameter names/order match PostGIS's 2D `ST_Affine` overload
+/// (`ST_Affine(geom, a, b, d, e, xoff, yoff)`).
+pub fn affine(g: &Geom, a: f64, b: f64, d: f64, e: f64, xoff: f64, yoff: f64) -> Option<Geom> {
+    use geo::MapCoords;
+    Some(g.map_coords(|c| geo_types::Coord {
+        x: a * c.x + d * c.y + xoff,
+        y: b * c.x + e * c.y + yoff,
+    }))
+}
+
+/// `ST_Segmentize(geom, max_len)` — split any segment longer than `max_len` into
+/// equal-length sub-segments so that no segment exceeds `max_len`. No-op when
+/// `max_len <= 0`. Operates on every LineString / ring in the geometry.
+pub fn segmentize(g: &Geom, max_len: f64) -> Option<Geom> {
+    if max_len <= 0.0 {
+        return Some(g.clone());
+    }
+    let seg = |ls: &geo_types::LineString<f64>| -> geo_types::LineString<f64> {
+        geo_types::LineString(segmentize_ring(&ls.0, max_len))
+    };
+    Some(match g {
+        Geometry::LineString(ls) => Geometry::LineString(seg(ls)),
+        Geometry::MultiLineString(mls) => Geometry::MultiLineString(geo_types::MultiLineString(
+            mls.0.iter().map(seg).collect(),
+        )),
+        Geometry::Polygon(p) => Geometry::Polygon(segmentize_polygon(p, max_len)),
+        Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(geo_types::MultiPolygon(
+            mp.0.iter().map(|p| segmentize_polygon(p, max_len)).collect(),
+        )),
+        Geometry::GeometryCollection(c) => Geometry::GeometryCollection(geo_types::GeometryCollection(
+            c.0.iter().filter_map(|item| segmentize(item, max_len)).collect(),
+        )),
+        other => other.clone(),
+    })
+}
+
+fn segmentize_polygon(p: &geo_types::Polygon<f64>, max_len: f64) -> geo_types::Polygon<f64> {
+    let ext = geo_types::LineString(segmentize_ring(&p.exterior().0, max_len));
+    let ints: Vec<_> = p
+        .interiors()
+        .iter()
+        .map(|r| geo_types::LineString(segmentize_ring(&r.0, max_len)))
+        .collect();
+    geo_types::Polygon::new(ext, ints)
+}
+
+/// Split a coordinate ring's segments so none exceeds `max_len`. Rings keep
+/// their closed-ness (the last point repeats the first when the input did).
+fn segmentize_ring(coords: &[geo_types::Coord<f64>], max_len: f64) -> Vec<geo_types::Coord<f64>> {
+    if coords.len() < 2 {
+        return coords.to_vec();
+    }
+    let mut out = Vec::with_capacity(coords.len() * 2);
+    out.push(coords[0]);
+    for w in coords.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len = dx.hypot(dy);
+        if len <= max_len {
+            out.push(b);
+            continue;
+        }
+        let n = (len / max_len).ceil() as usize;
+        for i in 1..=n {
+            let t = i as f64 / n as f64;
+            out.push(geo_types::Coord { x: a.x + t * dx, y: a.y + t * dy });
+        }
+    }
+    out
+}
+
+/// `ST_LineSubstring(geom, start_frac, end_frac)` — the substring of a
+/// LineString between two fractional lengths. Fractions are clamped to [0,1];
+/// returns NULL when `start_frac >= end_frac` or the input is not a LineString.
+pub fn line_substring(g: &Geom, start_frac: f64, end_frac: f64) -> Option<Geom> {
+    let ls = match g {
+        Geometry::LineString(ls) => ls,
+        _ => return None,
+    };
+    let d0 = start_frac.clamp(0.0, 1.0);
+    let d1 = end_frac.clamp(0.0, 1.0);
+    if d0 >= d1 {
+        return None;
+    }
+    let total: f64 = ls.lines().map(|l| line_len(&l)).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let sub = substring_line(ls, d0 * total, d1 * total, total);
+    Some(Geometry::LineString(sub))
+}
+
+/// Walk a LineString, emitting the portion between absolute lengths `from` and
+/// `to` (measured along the line from its start). The two endpoints are
+/// interpolated onto their containing segments.
+fn substring_line(
+    ls: &geo_types::LineString<f64>,
+    from: f64,
+    to: f64,
+    total: f64,
+) -> geo_types::LineString<f64> {
+    let mut out: Vec<geo_types::Coord<f64>> = Vec::new();
+    let mut acc = 0.0; // length consumed up to the start of the current segment
+    let mut pushed_start = false;
+    for line in ls.lines() {
+        let seg_len = line_len(&line);
+        let seg_end = acc + seg_len;
+        if !pushed_start && seg_end >= from {
+            let t = if seg_len > 0.0 { (from - acc) / seg_len } else { 0.0 };
+            let t = t.clamp(0.0, 1.0);
+            out.push(geo_types::Coord {
+                x: line.start.x + t * (line.end.x - line.start.x),
+                y: line.start.y + t * (line.end.y - line.start.y),
+            });
+            pushed_start = true;
+        }
+        if pushed_start {
+            if seg_end < to {
+                out.push(line.end);
+            } else {
+                let t = if seg_len > 0.0 { (to - acc) / seg_len } else { 0.0 };
+                let t = t.clamp(0.0, 1.0);
+                out.push(geo_types::Coord {
+                    x: line.start.x + t * (line.end.x - line.start.x),
+                    y: line.start.y + t * (line.end.y - line.start.y),
+                });
+                break;
+            }
+        }
+        acc = seg_end;
+    }
+    let _ = total; // total carried only for symmetry / debugging.
+    geo_types::LineString(out)
+}
+
+/// `ST_LineMerge(geom)` — join a MultiLineString into the fewest LineStrings
+/// possible by chaining segments whose endpoints touch. Non-LinearString input
+/// is returned unchanged.
+pub fn line_merge(g: &Geom) -> Option<Geom> {
+    let lines: Vec<geo_types::LineString<f64>> = match g {
+        Geometry::LineString(_) => return Some(g.clone()),
+        Geometry::MultiLineString(mls) => mls.0.clone(),
+        Geometry::GeometryCollection(c) => {
+            let mut out = Vec::new();
+            for item in &c.0 {
+                match item {
+                    Geometry::LineString(ls) => out.push(ls.clone()),
+                    Geometry::MultiLineString(mls) => out.extend(mls.0.iter().cloned()),
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => return Some(g.clone()),
+    };
+    let merged = merge_linestrings(lines);
+    Some(Geometry::MultiLineString(geo_types::MultiLineString(merged)))
+}
+
+/// Greedy endpoint-chaining merge: repeatedly take an unused LineString, extend
+/// its tail while another unused segment shares the endpoint (possibly
+/// reversed), then extend its head the same way. O(n^2) but n is small.
+fn merge_linestrings(lines: Vec<geo_types::LineString<f64>>) -> Vec<geo_types::LineString<f64>> {
+    if lines.is_empty() {
+        return lines;
+    }
+    let buffers: Vec<Vec<geo_types::Coord<f64>>> = lines.iter().map(|ls| ls.0.clone()).collect();
+    let mut used = vec![false; buffers.len()];
+    let mut out: Vec<geo_types::LineString<f64>> = Vec::new();
+    for start in 0..buffers.len() {
+        if used[start] {
+            continue;
+        }
+        used[start] = true;
+        let mut cur = buffers[start].clone();
+        loop {
+            // Try to extend the tail with another unused chain.
+            let tail = *cur.last().unwrap();
+            let mut found = None;
+            for (i, cand) in buffers.iter().enumerate() {
+                if used[i] || cand.is_empty() {
+                    continue;
+                }
+                let cfirst = cand[0];
+                let clast = *cand.last().unwrap();
+                let touches_first =
+                    (cfirst.x - tail.x).abs() < 1e-12 && (cfirst.y - tail.y).abs() < 1e-12;
+                let touches_last =
+                    (clast.x - tail.x).abs() < 1e-12 && (clast.y - tail.y).abs() < 1e-12;
+                if touches_first {
+                    found = Some((i, false));
+                    break;
+                }
+                if touches_last {
+                    found = Some((i, true));
+                    break;
+                }
+            }
+            match found {
+                Some((i, reverse)) => {
+                    used[i] = true;
+                    let mut ext = buffers[i].clone();
+                    if reverse {
+                        ext.reverse();
+                    }
+                    // Drop the shared junction vertex so it isn't duplicated.
+                    cur.extend(ext.into_iter().skip(1));
+                }
+                None => break,
+            }
+        }
+        out.push(geo_types::LineString(cur));
+    }
+    out
+}
+
+/// `ST_CollectionExtract(geom, dim)` — extract the geometries of one dimension
+/// from a (multi/collection) geometry: `1`→MultiPoint, `2`→MultiLineString,
+/// `3`→MultiPolygon. Non-matching members are dropped. Returns an empty
+/// GEOMETRYCOLLECTION for an unknown `dim` or no matches.
+pub fn collection_extract(g: &Geom, dim: i32) -> Option<Geom> {
+    let (mut pts, mut lns, mut pls): (
+        Vec<geo_types::Point<f64>>,
+        Vec<geo_types::LineString<f64>>,
+        Vec<geo_types::Polygon<f64>>,
+    ) = (Vec::new(), Vec::new(), Vec::new());
+    fn rec(
+        g: &Geom,
+        pts: &mut Vec<geo_types::Point<f64>>,
+        lns: &mut Vec<geo_types::LineString<f64>>,
+        pls: &mut Vec<geo_types::Polygon<f64>>,
+    ) {
+        match g {
+            Geometry::Point(p) => pts.push(*p),
+            Geometry::MultiPoint(mp) => pts.extend(mp.0.iter().copied()),
+            Geometry::LineString(ls) => lns.push(ls.clone()),
+            Geometry::MultiLineString(mls) => lns.extend(mls.0.iter().cloned()),
+            Geometry::Polygon(p) => pls.push(p.clone()),
+            Geometry::MultiPolygon(mp) => pls.extend(mp.0.iter().cloned()),
+            Geometry::GeometryCollection(c) => {
+                for item in &c.0 {
+                    rec(item, pts, lns, pls);
+                }
+            }
+            _ => {}
+        }
+    }
+    rec(g, &mut pts, &mut lns, &mut pls);
+    Some(match dim {
+        1 => Geometry::MultiPoint(geo_types::MultiPoint(pts)),
+        2 => Geometry::MultiLineString(geo_types::MultiLineString(lns)),
+        3 => Geometry::MultiPolygon(geo_types::MultiPolygon(pls)),
+        _ => Geometry::GeometryCollection(geo_types::GeometryCollection(vec![])),
+    })
+}
+
+/// `ST_ForcePolygonCCW(geom)` — exterior rings CCW, interior rings CW.
+pub fn force_polygon_ccw(g: &Geom) -> Option<Geom> {
+    use geo::Orient;
+    Some(match g {
+        Geometry::Polygon(p) => Geometry::Polygon(p.orient(geo::algorithm::orient::Direction::Default)),
+        Geometry::MultiPolygon(mp) => {
+            Geometry::MultiPolygon(mp.orient(geo::algorithm::orient::Direction::Default))
+        }
+        other => other.clone(),
+    })
+}
+
+/// `ST_ForceRHR(geom)` — force right-hand-rule orientation (exterior CW so the
+/// filled area is to the right). Alias of `force_polygon_cw`.
+pub fn force_rhr(g: &Geom) -> Option<Geom> {
+    force_polygon_cw(g)
+}
+
+/// `ST_ForceCollection(geom)` — wrap any geometry in a GeometryCollection.
+pub fn force_collection(g: &Geom) -> Option<Geom> {
+    match g {
+        Geometry::GeometryCollection(_) => Some(g.clone()),
+        other => Some(Geometry::GeometryCollection(geo_types::GeometryCollection(
+            vec![other.clone()],
+        ))),
+    }
+}
+
+/// `ST_Multi(geom)` — promote a single geometry to its Multi form. Multi and
+/// collection inputs pass through unchanged.
+pub fn multi(g: &Geom) -> Option<Geom> {
+    Some(match g {
+        Geometry::Point(p) => Geometry::MultiPoint(geo_types::MultiPoint(vec![*p])),
+        Geometry::LineString(ls) => {
+            Geometry::MultiLineString(geo_types::MultiLineString(vec![ls.clone()]))
+        }
+        Geometry::Polygon(p) => Geometry::MultiPolygon(geo_types::MultiPolygon(vec![p.clone()])),
+        other => other.clone(),
+    })
+}
+
+/// `ST_Normalize(geom)` — arrange geometry canonically: rings rotated to start
+/// at their lexicographically smallest coordinate, interior rings sorted,
+/// multi-members sorted. Lets topologically-equal geometries compare equal.
+pub fn normalize(g: &Geom) -> Option<Geom> {
+    Some(match g {
+        Geometry::LineString(ls) => Geometry::LineString(normalize_ring(ls.clone())),
+        Geometry::Polygon(p) => Geometry::Polygon(normalize_polygon(p)),
+        Geometry::MultiLineString(mls) => {
+            let mut v: Vec<_> = mls.0.iter().cloned().map(normalize_ring).collect();
+            v.sort_by(coords_cmp);
+            Geometry::MultiLineString(geo_types::MultiLineString(v))
+        }
+        Geometry::MultiPolygon(mp) => {
+            let mut v: Vec<_> = mp.0.iter().map(|p| normalize_polygon(p)).collect();
+            v.sort_by(poly_cmp);
+            Geometry::MultiPolygon(geo_types::MultiPolygon(v))
+        }
+        Geometry::MultiPoint(mp) => {
+            let mut v = mp.0.clone();
+            v.sort_by(|a, b| {
+                a.x().partial_cmp(&b.x())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.y().partial_cmp(&b.y()).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            Geometry::MultiPoint(geo_types::MultiPoint(v))
+        }
+        other => other.clone(),
+    })
+}
+
+fn normalize_ring(mut ls: geo_types::LineString<f64>) -> geo_types::LineString<f64> {
+    if ls.0.len() >= 2 && ls.0.first() == ls.0.last() {
+        // Closed ring: drop the repeated closing vertex, rotate, re-close.
+        let closing = ls.0.pop();
+        let n = ls.0.len();
+        if n > 0 {
+            let mut start = 0;
+            for i in 1..n {
+                if coords_lt(&ls.0[i], &ls.0[start]) {
+                    start = i;
+                }
+            }
+            ls.0.rotate_left(start);
+        }
+        if let Some(c) = closing {
+            ls.0.push(c);
+        }
+    }
+    ls
+}
+fn normalize_polygon(p: &geo_types::Polygon<f64>) -> geo_types::Polygon<f64> {
+    let ext = normalize_ring(p.exterior().clone());
+    let mut ints: Vec<_> = p.interiors().iter().cloned().map(normalize_ring).collect();
+    ints.sort_by(coords_cmp);
+    geo_types::Polygon::new(ext, ints)
+}
+/// Lexicographic ordering of two LineStrings' coordinate sequences. (`Coord`
+/// is not `Ord` because `f64` isn't, so we compare component-wise via
+/// `partial_cmp`, treating NaN as less-than-everything.)
+fn coords_cmp(
+    a: &geo_types::LineString<f64>,
+    b: &geo_types::LineString<f64>,
+) -> std::cmp::Ordering {
+    coord_slice_cmp(&a.0, &b.0)
+}
+fn poly_cmp(a: &geo_types::Polygon<f64>, b: &geo_types::Polygon<f64>) -> std::cmp::Ordering {
+    coord_slice_cmp(&a.exterior().0, &b.exterior().0)
+}
+fn coord_slice_cmp(
+    a: &[geo_types::Coord<f64>],
+    b: &[geo_types::Coord<f64>],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let len = a.len().min(b.len());
+    for i in 0..len {
+        match a[i]
+            .x
+            .partial_cmp(&b[i].x)
+            .unwrap_or(Ordering::Equal)
+            .then(a[i].y.partial_cmp(&b[i].y).unwrap_or(Ordering::Equal))
+        {
+            Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    a.len().cmp(&b.len())
+}
+fn coords_lt(a: &geo_types::Coord<f64>, b: &geo_types::Coord<f64>) -> bool {
+    a.x < b.x || (a.x == b.x && a.y < b.y)
+}
+
+// ----- measurements & processing (Tier 1b) ------------------------------
+
+/// Length of a single 2D segment.
+fn line_len(l: &geo_types::Line<f64>) -> f64 {
+    let dx = l.end.x - l.start.x;
+    let dy = l.end.y - l.start.y;
+    dx.hypot(dy)
+}
+
+/// All vertices of a geometry, flattened (same as `all_coords` but kept
+/// explicit here for the distance-based measurements).
+fn vertices(g: &Geom) -> Vec<geo_types::Coord<f64>> {
+    all_coords(g)
+}
+
+/// `ST_MaxDistance(a, b)` — greatest distance between any vertex of `a` and any
+/// vertex of `b`. Returns 0.0 when either side has no vertices.
+pub fn max_distance(a: &Geom, b: &Geom) -> Option<f64> {
+    let va = vertices(a);
+    let vb = vertices(b);
+    if va.is_empty() || vb.is_empty() {
+        return Some(0.0);
+    }
+    let mut best = 0.0_f64;
+    for p in &va {
+        for q in &vb {
+            let d = (p.x - q.x).hypot(p.y - q.y);
+            if d > best {
+                best = d;
+            }
+        }
+    }
+    Some(best)
+}
+
+/// `ST_LongestLine(a, b)` — the 2-point LineString joining the pair of vertices
+/// (one from each geometry) that realize `ST_MaxDistance`.
+pub fn longest_line(a: &Geom, b: &Geom) -> Option<Geom> {
+    let va = vertices(a);
+    let vb = vertices(b);
+    if va.is_empty() || vb.is_empty() {
+        return None;
+    }
+    let mut best = 0.0_f64;
+    let mut bestp = (va[0], vb[0]);
+    for p in &va {
+        for q in &vb {
+            let d = (p.x - q.x).hypot(p.y - q.y);
+            if d > best {
+                best = d;
+                bestp = (*p, *q);
+            }
+        }
+    }
+    Some(Geometry::LineString(geo_types::LineString::from(vec![
+        (bestp.0.x, bestp.0.y),
+        (bestp.1.x, bestp.1.y),
+    ])))
+}
+
+/// `ST_ShortestLine(a, b)` — the 2-point LineString joining the closest points
+/// of `a` and `b`, considering vertex-vertex, vertex-segment, and
+/// segment-vertex distances (so the endpoint may lie mid-segment).
+pub fn shortest_line(a: &Geom, b: &Geom) -> Option<Geom> {
+    let va = vertices(a);
+    let vb = vertices(b);
+    let sa = segments(a);
+    let sb = segments(b);
+    if va.is_empty() && sa.is_empty() || vb.is_empty() && sb.is_empty() {
+        return None;
+    }
+    let mut best = f64::INFINITY;
+    let zero = geo_types::Coord { x: 0.0, y: 0.0 };
+    let mut bestpair = (
+        va.first().copied().unwrap_or(zero),
+        vb.first().copied().unwrap_or(zero),
+    );
+    let consider = |p: geo_types::Coord<f64>, q: geo_types::Coord<f64>,
+                    best: &mut f64,
+                    bestpair: &mut (geo_types::Coord<f64>, geo_types::Coord<f64>)| {
+        let d = (p.x - q.x).hypot(p.y - q.y);
+        if d < *best {
+            *best = d;
+            *bestpair = (p, q);
+        }
+    };
+    // vertex(a) vs vertex(b)
+    for p in &va {
+        for q in &vb {
+            consider(*p, *q, &mut best, &mut bestpair);
+        }
+    }
+    // vertex(a) vs segment(b), and segment(a) vs vertex(b)
+    for p in &va {
+        for s in &sb {
+            let q = closest_on_segment(p, s);
+            consider(*p, q, &mut best, &mut bestpair);
+        }
+    }
+    for s in &sa {
+        for q in &vb {
+            let p = closest_on_segment(q, s);
+            consider(p, *q, &mut best, &mut bestpair);
+        }
+    }
+    Some(Geometry::LineString(geo_types::LineString::from(vec![
+        (bestpair.0.x, bestpair.0.y),
+        (bestpair.1.x, bestpair.1.y),
+    ])))
+}
+
+/// All (directed) segments of a geometry as start/end coordinate pairs.
+fn segments(g: &Geom) -> Vec<(geo_types::Coord<f64>, geo_types::Coord<f64>)> {
+    let mut out = Vec::new();
+    let from_ring = |coords: &[geo_types::Coord<f64>], out: &mut Vec<_>| {
+        for w in coords.windows(2) {
+            out.push((w[0], w[1]));
+        }
+    };
+    match g {
+        Geometry::Line(l) => out.push((l.start, l.end)),
+        Geometry::LineString(ls) => from_ring(&ls.0, &mut out),
+        Geometry::MultiLineString(mls) => for ls in &mls.0 {
+            from_ring(&ls.0, &mut out)
+        },
+        Geometry::Polygon(p) => {
+            from_ring(&p.exterior().0, &mut out);
+            for r in p.interiors() {
+                from_ring(&r.0, &mut out);
+            }
+        }
+        Geometry::MultiPolygon(mp) => for p in &mp.0 {
+            from_ring(&p.exterior().0, &mut out);
+            for r in p.interiors() {
+                from_ring(&r.0, &mut out);
+            }
+        },
+        Geometry::GeometryCollection(c) => for item in &c.0 {
+            out.extend(segments(item));
+        },
+        _ => {}
+    }
+    out
+}
+
+/// Closest point on segment `s` to point `p`.
+fn closest_on_segment(
+    p: &geo_types::Coord<f64>,
+    s: &(geo_types::Coord<f64>, geo_types::Coord<f64>),
+) -> geo_types::Coord<f64> {
+    let (a, b) = s;
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 == 0.0 {
+        return *a;
+    }
+    let t = (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0);
+    geo_types::Coord {
+        x: a.x + t * dx,
+        y: a.y + t * dy,
+    }
+}
+
+/// `ST_TriangulatePolygon(geom)` — a triangulation of a polygon's area. We
+/// Delaunay-triangulate the vertex set (via `delaunator`) and keep the triangles
+/// whose centroid is inside the polygon (inside the exterior ring and outside
+/// every hole). For convex polygons this is exact; for concile / holed input it
+/// is a Delaunay-based approximation of constrained triangulation, documented
+/// in ROADMAP.md.
+pub fn triangulate_polygon(g: &Geom) -> Option<Geom> {
+    let polys: Vec<&geo_types::Polygon<f64>> = match g {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0.iter().collect(),
+        _ => return None,
+    };
+    if polys.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Geometry> = Vec::new();
+    for poly in &polys {
+        for tri in delaunay_interior(*poly) {
+            out.push(Geometry::Polygon(tri));
+        }
+    }
+    Some(Geometry::GeometryCollection(geo_types::GeometryCollection(out)))
+}
+
+/// Delaunay triangulation of a single polygon's vertices, filtered to triangles
+/// whose centroid lies inside the polygon.
+fn delaunay_interior(poly: &geo_types::Polygon<f64>) -> Vec<geo_types::Polygon<f64>> {
+    let mut coords = Vec::new();
+    coords.extend(poly.exterior().0.iter().copied());
+    for r in poly.interiors() {
+        coords.extend(r.0.iter().copied());
+    }
+    // Drop exact duplicate vertices (polygon rings repeat their closing vertex,
+    // and `delaunator` misbehaves on coincident input points).
+    if coords.len() >= 2 {
+        let last = *coords.last().unwrap();
+        if coords[0].x == last.x && coords[0].y == last.y {
+            coords.pop();
+        }
+    }
+    coords.dedup_by(|a, b| a.x == b.x && a.y == b.y);
+    if coords.len() < 3 {
+        return Vec::new();
+    }
+    let pts: Vec<delaunator::Point> = coords
+        .iter()
+        .map(|c| delaunator::Point { x: c.x, y: c.y })
+        .collect();
+    let tri = delaunator::triangulate(&pts);
+    let t = &tri.triangles;
+    let to_tri = |i: usize| {
+        let a = coords[t[i]];
+        let b = coords[t[i + 1]];
+        let c = coords[t[i + 2]];
+        // Order so the triangle is closed and CCW.
+        let ring = geo_types::LineString::from(vec![
+            (a.x, a.y),
+            (b.x, b.y),
+            (c.x, c.y),
+            (a.x, a.y),
+        ]);
+        geo_types::Polygon::new(ring, vec![])
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < t.len() {
+        let triangle = to_tri(i);
+        let cx = (coords[t[i]].x + coords[t[i + 1]].x + coords[t[i + 2]].x) / 3.0;
+        let cy = (coords[t[i]].y + coords[t[i + 1]].y + coords[t[i + 2]].y) / 3.0;
+        if point_in_polygon(cx, cy, poly) {
+            out.push(triangle);
+        }
+        i += 3;
+    }
+    out
+}
+
+// ----- accessors / type predicates / I/O --------------------------------
+
+/// `ST_NRings(geom)` — total number of rings (exterior + interior) across all
+/// polygons in the geometry.
+pub fn n_rings(g: &Geom) -> Option<i32> {
+    let rec = |g: &Geom| -> usize {
+        match g {
+            Geometry::Polygon(p) => 1 + p.interiors().len(),
+            Geometry::MultiPolygon(mp) => {
+                mp.0.iter().map(|p| 1 + p.interiors().len()).sum()
+            }
+            Geometry::GeometryCollection(c) => c.0.iter().map(|item| n_rings(item).unwrap_or(0) as usize).sum(),
+            _ => 0,
+        }
+    };
+    rec(g).try_into().ok()
+}
+
+/// `ST_OrderingEquals(a, b)` — structural equality: same type, same coordinate
+/// order. Implemented as byte-equal canonical WKB, which our serializer
+/// guarantees is canonical per-geometry.
+pub fn ordering_equals(a: &Geom, b: &Geom) -> Option<bool> {
+    let ka = crate::geometry::to_wkb(a).ok()?;
+    let kb = crate::geometry::to_wkb(b).ok()?;
+    Some(ka == kb)
+}
+
+/// `ST_IsPoint(geom)`.
+pub fn is_point(g: &Geom) -> Option<bool> {
+    Some(matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)))
+}
+/// `ST_IsLineString(geom)`.
+pub fn is_linestring(g: &Geom) -> Option<bool> {
+    Some(matches!(g, Geometry::LineString(_) | Geometry::Line(_) | Geometry::MultiLineString(_)))
+}
+/// `ST_IsPolygon(geom)`.
+pub fn is_polygon(g: &Geom) -> Option<bool> {
+    Some(matches!(g, Geometry::Polygon(_) | Geometry::MultiPolygon(_)))
+}
+
+/// `ST_AsHexEWKB(geom)` — uppercase hex of the geometry's WKB (SRID-less, so
+/// EWKB == WKB here).
+pub fn as_hex_ewkb(g: &Geom) -> Option<String> {
+    let bytes = crate::geometry::to_wkb(g).ok()?;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        s.push_str(&format!("{:02X}", byte));
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,5 +1975,236 @@ mod tests {
             assert!(got.is_some(), "ROUNDTRIP FAILED (pure rust) for {label}: {wkt} -> {got:?}");
             println!("{label}: {got:?}");
         }
+    }
+
+    // ---- Tier 1 / 1b batch ----------------------------------------------
+
+    fn rect_poly(x0: f64, y0: f64, x1: f64, y1: f64) -> Geom {
+        Geometry::Polygon(geo_types::Polygon::new(
+            geo_types::LineString::from(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]),
+            vec![],
+        ))
+    }
+    fn ls(coords: &[(f64, f64)]) -> Geom {
+        Geometry::LineString(geo_types::LineString::from(coords.to_vec()))
+    }
+
+    #[test]
+    fn affine_acts_as_translate_with_identity_matrix() {
+        // a=1, b=0, d=0, e=1, xoff=5, yoff=5  ==> pure translate (5,5).
+        let out = affine(&wkt_point(1.0, 2.0), 1.0, 0.0, 0.0, 1.0, 5.0, 5.0).unwrap();
+        match out {
+            Geometry::Point(p) => {
+                assert!((p.x() - 6.0).abs() < 1e-9);
+                assert!((p.y() - 7.0).abs() < 1e-9);
+            }
+            other => panic!("expected point, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn affine_scales_with_2x_3x_matrix() {
+        // a=2, b=0, d=0, e=3, xoff=0, yoff=0  ==> scale (2,3).
+        let out = affine(&wkt_point(1.0, 1.0), 2.0, 0.0, 0.0, 3.0, 0.0, 0.0).unwrap();
+        match out {
+            Geometry::Point(p) => {
+                assert!((p.x() - 2.0).abs() < 1e-9);
+                assert!((p.y() - 3.0).abs() < 1e-9);
+            }
+            other => panic!("expected point, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segmentize_splits_long_segments() {
+        let out = segmentize(&ls(&[(0.0, 0.0), (10.0, 0.0)]), 4.0).unwrap();
+        let n = num_points(&out).unwrap();
+        // 10/4 = 2.5 -> ceil = 3 sub-segments -> 4 vertices for an open line.
+        assert_eq!(n, 4, "segmentize should produce 4 vertices");
+    }
+
+    #[test]
+    fn segmentize_noop_for_short_segments() {
+        let out = segmentize(&ls(&[(0.0, 0.0), (1.0, 0.0)]), 4.0).unwrap();
+        assert_eq!(num_points(&out).unwrap(), 2);
+    }
+
+    #[test]
+    fn line_substring_middle_half() {
+        let out = line_substring(&ls(&[(0.0, 0.0), (10.0, 0.0)]), 0.25, 0.75).unwrap();
+        match out {
+            Geometry::LineString(ls) => {
+                let xs: Vec<f64> = ls.0.iter().map(|c| c.x).collect();
+                assert!((xs.first().unwrap() - 2.5).abs() < 1e-9);
+                assert!((xs.last().unwrap() - 7.5).abs() < 1e-9);
+            }
+            other => panic!("expected linestring, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_substring_returns_none_for_inverted_fraction() {
+        assert!(line_substring(&ls(&[(0.0, 0.0), (10.0, 0.0)]), 0.75, 0.25).is_none());
+    }
+
+    #[test]
+    fn line_merge_chains_touching_lines() {
+        let mls = Geometry::MultiLineString(geo_types::MultiLineString(vec![
+            geo_types::LineString::from(vec![(0.0, 0.0), (1.0, 0.0)]),
+            geo_types::LineString::from(vec![(1.0, 0.0), (2.0, 0.0)]),
+        ]));
+        let out = line_merge(&mls).unwrap();
+        match out {
+            Geometry::MultiLineString(mls) => {
+                assert_eq!(mls.0.len(), 1, "merged into a single linestring");
+                assert_eq!(mls.0[0].0.len(), 3);
+            }
+            other => panic!("expected multilinestring, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collection_extract_polygons() {
+        let gc = Geometry::GeometryCollection(geo_types::GeometryCollection(vec![
+            rect_poly(0.0, 0.0, 1.0, 1.0),
+            ls(&[(0.0, 0.0), (1.0, 1.0)]),
+            wkt_point(2.0, 2.0),
+        ]));
+        let out = collection_extract(&gc, 3).unwrap();
+        match out {
+            Geometry::MultiPolygon(mp) => assert_eq!(mp.0.len(), 1),
+            other => panic!("expected multipolygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_collection_wraps_single_geom() {
+        let out = force_collection(&wkt_point(1.0, 2.0)).unwrap();
+        match out {
+            Geometry::GeometryCollection(c) => assert_eq!(c.0.len(), 1),
+            other => panic!("expected collection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_promotes_single_to_multi() {
+        let out = multi(&wkt_point(1.0, 2.0)).unwrap();
+        assert!(matches!(out, Geometry::MultiPoint(_)));
+        let out2 = multi(&rect_poly(0.0, 0.0, 1.0, 1.0)).unwrap();
+        assert!(matches!(out2, Geometry::MultiPolygon(_)));
+    }
+
+    #[test]
+    fn normalize_rotates_closed_ring_to_smallest_vertex() {
+        // Polygon ring not starting at the smallest coord normalizes so its
+        // exterior begins at the lex-min vertex.
+        let p = rect_poly(2.0, 0.0, 4.0, 2.0);
+        let out = normalize(&p).unwrap();
+        match out {
+            Geometry::Polygon(poly) => {
+                let first = poly.exterior().0[0];
+                // The lex-min vertex of this ring is (0,0)-relative... here (2,0).
+                assert!((first.x - 2.0).abs() < 1e-9 && (first.y - 0.0).abs() < 1e-9);
+            }
+            other => panic!("expected polygon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_distance_between_two_squares() {
+        let a = rect_poly(0.0, 0.0, 1.0, 1.0);
+        let b = rect_poly(4.0, 4.0, 5.0, 5.0);
+        let d = max_distance(&a, &b).unwrap();
+        // furthest pair: (0,0) and (5,5) -> sqrt(50)
+        assert!((d - 50.0_f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn longest_line_realizes_max_distance() {
+        let a = rect_poly(0.0, 0.0, 1.0, 1.0);
+        let b = rect_poly(4.0, 4.0, 5.0, 5.0);
+        let line = longest_line(&a, &b).unwrap();
+        match line {
+            Geometry::LineString(ls) => {
+                let dx = ls.0[1].x - ls.0[0].x;
+                let dy = ls.0[1].y - ls.0[0].y;
+                assert!((dx.hypot(dy) - 50.0_f64.sqrt()).abs() < 1e-9);
+            }
+            other => panic!("expected linestring, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shortest_line_between_point_and_segment() {
+        // Point straight above the midpoint of a horizontal segment: shortest
+        // line should land at (1,0) and have length 1.
+        let p = wkt_point(1.0, 1.0);
+        let s = ls(&[(0.0, 0.0), (2.0, 0.0)]);
+        let line = shortest_line(&p, &s).unwrap();
+        match line {
+            Geometry::LineString(ls) => {
+                assert!((ls.0[1].x - 1.0).abs() < 1e-9);
+                assert!((ls.0[1].y - 0.0).abs() < 1e-9);
+            }
+            other => panic!("expected linestring, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triangulate_polygon_covers_area() {
+        let p = rect_poly(0.0, 0.0, 2.0, 2.0);
+        let out = triangulate_polygon(&p).unwrap();
+        // Two triangles whose total area == the rectangle area (4).
+        let mut total = 0.0_f64;
+        if let Geometry::GeometryCollection(c) = &out {
+            for item in &c.0 {
+                if let Geometry::Polygon(t) = item {
+                    total += t.unsigned_area();
+                }
+            }
+        }
+        assert!((total - 4.0).abs() < 1e-9, "triangulation covers the area");
+    }
+
+    #[test]
+    fn n_rings_counts_exterior_and_holes() {
+        let p = Geometry::Polygon(geo_types::Polygon::new(
+            geo_types::LineString::from(vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]),
+            vec![geo_types::LineString::from(vec![
+                (2.0, 2.0), (4.0, 2.0), (4.0, 4.0), (2.0, 4.0), (2.0, 2.0),
+            ])],
+        ));
+        assert_eq!(n_rings(&p).unwrap(), 2);
+        // A bare polygon: 1 exterior + 1 hole = 2 rings.
+    }
+
+    #[test]
+    fn ordering_equals_byte_equal_wkb() {
+        let a = wkt_point(1.0, 2.0);
+        let b = wkt_point(1.0, 2.0);
+        assert_eq!(ordering_equals(&a, &b), Some(true));
+        let c = wkt_point(1.0, 3.0);
+        assert_eq!(ordering_equals(&a, &c), Some(false));
+    }
+
+    #[test]
+    fn type_predicates() {
+        assert_eq!(is_point(&wkt_point(0.0, 0.0)), Some(true));
+        assert_eq!(is_linestring(&wkt_point(0.0, 0.0)), Some(false));
+        assert_eq!(is_polygon(&rect_poly(0.0, 0.0, 1.0, 1.0)), Some(true));
+        assert_eq!(is_polygon(&wkt_point(0.0, 0.0)), Some(false));
+    }
+
+    #[test]
+    fn as_hex_ewkb_is_uppercase_hex() {
+        let g = wkt_point(1.0, 2.0);
+        let wkb = crate::geometry::to_wkb(&g).unwrap();
+        let h = as_hex_ewkb(&g).unwrap();
+        assert_eq!(h.len(), wkb.len() * 2);
+        // Starts with the LE marker byte 01.
+        assert!(h.starts_with("01"));
+        // Every char is a hex digit; the encoding is uppercase (A-F where used).
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(h.chars().all(|c| !c.is_ascii_lowercase()));
     }
 }

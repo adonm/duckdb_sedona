@@ -287,6 +287,33 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
         }};
     }
 
+    // -- (Geometry, DOUBLE×6) -> Geometry (ST_Affine 2D) ------------------
+    macro_rules! register_geom_double6_to_geom {
+        ($name:expr, $func:path) => {{
+            unsafe extern "C" fn cb(
+                _info: duckdb_function_info,
+                input: duckdb_data_chunk,
+                output: duckdb_vector,
+            ) {
+                dispatch::geom_double6_to_geom(input, output, $func);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+
     // -- (DOUBLE, DOUBLE) -> Geometry (point constructor) -------------------
     macro_rules! register_doubles2_geom {
         ($name:expr, $func:path) => {{
@@ -430,6 +457,31 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_unary_geom!("st_delaunaytriangles", functions::delaunay_triangles);
     register_unary_geom!("st_voronoilines", functions::voronoi_lines);
 
+    // --- Tier 1/1b parity batch: editing, transforms, measurements ---------
+    register_geom_double6_to_geom!("st_affine", functions::affine);
+    register_geom_double_to_geom!("st_segmentize", functions::segmentize);
+    register_geom_double2_to_geom!("st_linesubstring", functions::line_substring);
+    register_unary_geom!("st_linemerge", functions::line_merge);
+    register_geom_int_to_geom!("st_collectionextract", functions::collection_extract);
+    register_unary_geom!("st_forcepolygonccw", functions::force_polygon_ccw);
+    register_unary_geom!("st_forcerhr", functions::force_rhr);
+    register_unary_geom!("st_forcecollection", functions::force_collection);
+    register_unary_geom!("st_normalize", functions::normalize);
+    register_unary_geom!("st_multi", functions::multi);
+    register_unary_geom!("st_triangulatepolygon", functions::triangulate_polygon);
+    register_binary_double!("st_maxdistance", functions::max_distance);
+    register_binary_geom!("st_longestline", functions::longest_line);
+    register_binary_geom!("st_shortestline", functions::shortest_line);
+    register_geom_int!("st_nrings", functions::n_rings);
+    register_geom_int!("st_numinteriorring", functions::num_interior_rings); // PostGIS alias
+    register_predicate!("st_orderingequals", functions::ordering_equals);
+    register_geom_bool!("st_ispoint", functions::is_point);
+    register_geom_bool!("st_islinestring", functions::is_linestring);
+    register_geom_bool!("st_ispolygon", functions::is_polygon);
+    register_unary_geom!("st_asewkb", functions::geom_from_wkb); // SRID-less: EWKB == WKB
+    register_unary_geom!("st_geomfromewkb", functions::geom_from_wkb); // EWKB-tolerant from_wkb
+    register_geom_varchar!("st_ashexewkb", functions::as_hex_ewkb);
+
     // (geom, int) -> geom
     register_geom_int_to_geom!("st_geometryn", functions::geometry_n);
     register_geom_int_to_geom!("st_pointn", functions::point_n);
@@ -521,6 +573,20 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .combine(dispatch::envelope_combine)
             .finalize(dispatch::envelope_finalize)
             .destructor(dispatch::envelope_destroy)
+            .register(con)?;
+    }
+
+    // --- aggregate: ST_Union (cascaded polygonal union) ------------------
+    unsafe {
+        AggregateFunctionBuilder::new("st_union_agg")
+            .param(TypeId::Blob)
+            .returns(TypeId::Blob)
+            .state_size(dispatch::union_state_size)
+            .init(dispatch::union_state_init)
+            .update(dispatch::union_update)
+            .combine(dispatch::union_combine)
+            .finalize(dispatch::union_finalize)
+            .destructor(dispatch::union_destroy)
             .register(con)?;
     }
 
