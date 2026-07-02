@@ -65,16 +65,16 @@ gdal = { version = "0.19", features = ["bindgen"] }
 # target OR has a correctness bug on the hot path that we need to fix at source
 # rather than work around.
 #
-# - `gdal` 0.19: lags libgdal 3.13 C-API renames. Only the high-level `gdal`
-#   crate is patched; `gdal-sys` comes unpatched from crates.io. See
-#   vendor/gdal/PATCHES.md.
-# - `quack-rs` 0.14: `VectorReader::read_blob` routes BLOBs through a UTF-8-
-#   validating reader, silently returning empty bytes for binary WKB (~half of
-#   all geometries). We fix `read_blob` at the source and add a `Value::as_blob`
-#   accessor for table-function bind parameters. See vendor/quack-rs/PATCHES.md.
+# - `gdal` 0.19: upstream `georust/gdal` lags libgdal 3.13 C-API renames
+#   (GDT_Byte→GDT_UInt8, bOperateInBufType). Patched on fork branch
+#   `fix/gdal-3.13-support` at `github.com/adonm/gdal`. When upstream lands
+#   3.13 support, drop the patch line.
+# - `quack-rs` 0.14: upstreamed to fork branch `feat/c-api-full-coverage` on
+#   `github.com/adonm/quack-rs`. Includes the `read_blob` binary-safety fix,
+#   `Value::as_blob`, and 88% C-API coverage. See `.tmp/quack-rs/COVERAGE.md`.
 [patch.crates-io]
-gdal = { path = "vendor/gdal" }
-quack-rs = { path = "vendor/quack-rs" }
+gdal = { git = "https://github.com/adonm/gdal", branch = "fix/gdal-3.13-support" }
+quack-rs = { git = "https://github.com/adonm/quack-rs", branch = "feat/c-api-full-coverage" }
 
 [profile.release]
 panic = "abort"

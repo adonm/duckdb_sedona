@@ -758,6 +758,7 @@ dependencies = [
 [[package]]
 name = "gdal"
 version = "0.19.0"
+source = "git+https://github.com/adonm/gdal?branch=fix%2Fgdal-3.13-support#643edc3c3b3a88f17d47087e03adfd73e9d8379f"
 dependencies = [
  "bitflags",
  "chrono",
@@ -770,8 +771,7 @@ dependencies = [
 [[package]]
 name = "gdal-sys"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cceef1cc08a1f031c5717cb645bb361a3114470cc142cc96bc5e62b79695632e"
+source = "git+https://github.com/adonm/gdal?branch=fix%2Fgdal-3.13-support#643edc3c3b3a88f17d47087e03adfd73e9d8379f"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -1747,6 +1747,7 @@ dependencies = [
 [[package]]
 name = "quack-rs"
 version = "0.14.0"
+source = "git+https://github.com/adonm/quack-rs?branch=feat%2Fc-api-full-coverage#25fc65674b3cd9bb4630a48a41378b2f4a0a8439"
 dependencies = [
  "cc",
  "libduckdb-sys",

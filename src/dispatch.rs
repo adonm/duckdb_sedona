@@ -24,6 +24,7 @@
 // (e.g. any coordinate whose IEEE-754 bytes form an invalid UTF-8 sequence).
 // We parse the 16-byte `duckdb_string_t` ourselves to get the raw bytes.
 
+use geo::algorithm::bool_ops::BooleanOps;
 use geo_types::{Geometry, MultiPolygon};
 use libduckdb_sys::{
     duckdb_aggregate_state, duckdb_data_chunk, duckdb_function_info, duckdb_vector, idx_t,
@@ -33,6 +34,7 @@ use quack_rs::data_chunk::DataChunk;
 use quack_rs::vector::{VectorReader, VectorWriter};
 
 use crate::geometry::{self, Geom};
+use crate::functions::to_multi_polygon;
 
 /// Read & parse the geometry at `row` of a BLOB column.
 ///
@@ -517,6 +519,34 @@ where
     }
 }
 
+/// Vectorized executor for `(geometry, geometry, DOUBLE) -> geometry`
+/// (`ST_Snap`).
+pub fn geom_geom_double_to_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
+where
+    F: Fn(&Geom, &Geom, f64) -> Option<Geom>,
+{
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
+    let scalar = unsafe { VectorReader::new(chunk.as_raw(), 2) };
+    let mut writer = unsafe { VectorWriter::new(output) };
+
+    for row in 0..left.row_count() {
+        let (Some(a), Some(b)) = (read_geom(&left, row), read_geom(&right, row)) else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        let Some(t) = read_f64(&scalar, row) else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        match f(&a, &b, t).and_then(|out| geometry::to_wkb(&out).ok()) {
+            Some(bytes) => unsafe { writer.write_blob(row, &bytes) },
+            None => unsafe { writer.set_null(row) },
+        }
+    }
+}
+
 /// Marker so the `#[allow(dead_code)]` on `Geometry` stays meaningful.
 #[allow(dead_code)]
 type _DocGeometry = Geometry<f64>;
@@ -842,6 +872,127 @@ pub unsafe extern "C" fn union_finalize(
 }
 pub unsafe extern "C" fn union_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
     unsafe { FfiState::<UnionAggState>::destroy_callback(states, count) };
+}
+
+// ---------------------------------------------------------------------------
+// ST_Intersection aggregate (cascaded polygonal intersection)
+// ---------------------------------------------------------------------------
+
+/// Per-group state for `ST_Intersection` aggregate: the running intersection
+/// as an optional `MultiPolygon`. `None` means "no geometries seen yet"
+/// (the identity for intersection is the universe — the first geometry
+/// initializes, subsequent geometries are intersected in).
+#[derive(Default)]
+pub struct IntersectionAggState {
+    pub mp: Option<MultiPolygon>,
+}
+impl AggregateState for IntersectionAggState {}
+
+#[inline]
+fn expand_intersection(state: &mut IntersectionAggState, g: &Geom) {
+    let incoming = to_multi_polygon(g);
+    match &mut state.mp {
+        None => state.mp = Some(incoming),
+        Some(current) => {
+            if current.0.is_empty() {
+                // Keep current empty — intersection with anything is empty.
+            } else if incoming.0.is_empty() {
+                // Incoming is empty → intersection is empty.
+                current.0.clear();
+            } else {
+                let new_mp = current.intersection(&incoming);
+                *current = new_mp;
+            }
+        }
+    }
+}
+
+pub unsafe extern "C" fn intersection_state_size(info: duckdb_function_info) -> idx_t {
+    unsafe { FfiState::<IntersectionAggState>::size_callback(info) }
+}
+
+pub unsafe extern "C" fn intersection_state_init(info: duckdb_function_info, state: duckdb_aggregate_state) {
+    unsafe { FfiState::<IntersectionAggState>::init_callback(info, state) };
+}
+
+pub unsafe extern "C" fn intersection_update(
+    _info: duckdb_function_info,
+    input: duckdb_data_chunk,
+    states: *mut duckdb_aggregate_state,
+) {
+    let col = unsafe { VectorReader::new(input, 0) };
+    for row in 0..col.row_count() {
+        let Some(bytes) = read_blob(&col, row) else { continue };
+        let Ok(g) = geometry::from_wkb(bytes) else { continue };
+        let state_ptr = unsafe { *states.add(row) };
+        if let Some(st) = unsafe { FfiState::<IntersectionAggState>::with_state_mut(state_ptr) } {
+            expand_intersection(st, &g);
+        }
+    }
+}
+
+pub unsafe extern "C" fn intersection_combine(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: idx_t,
+) {
+    for i in 0..count as usize {
+        let src_ptr = unsafe { *source.add(i) };
+        let tgt_ptr = unsafe { *target.add(i) };
+        let src = unsafe { FfiState::<IntersectionAggState>::with_state(src_ptr) };
+        let tgt = unsafe { FfiState::<IntersectionAggState>::with_state_mut(tgt_ptr) };
+        if let (Some(s), Some(t)) = (src, tgt) {
+            match (&s.mp, &mut t.mp) {
+                (None, _) => {} // source has no data; skip
+                (Some(src_mp), None) => t.mp = Some(src_mp.clone()),
+                (Some(src_mp), Some(tgt_mp)) => {
+                    if src_mp.0.is_empty() || tgt_mp.0.is_empty() {
+                        tgt_mp.0.clear();
+                    } else {
+                        let new_mp = tgt_mp.intersection(src_mp);
+                        *tgt_mp = new_mp;
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub unsafe extern "C" fn intersection_finalize(
+    _info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    result: duckdb_vector,
+    count: idx_t,
+    offset: idx_t,
+) {
+    let mut writer = unsafe { VectorWriter::new(result) };
+    for i in 0..count as usize {
+        let out_row = offset as usize + i;
+        let state_ptr = unsafe { *source.add(i) };
+        match unsafe { FfiState::<IntersectionAggState>::with_state(state_ptr) } {
+            Some(st) => match &st.mp {
+                Some(mp) if !mp.0.is_empty() => {
+                    let g = Geometry::MultiPolygon(mp.clone());
+                    match geometry::to_wkb(&g) {
+                        Ok(b) => unsafe { writer.write_blob(out_row, &b) },
+                        Err(_) => unsafe { writer.set_null(out_row) },
+                    }
+                }
+                Some(_) => {
+                    // Empty intersection → NULL (matches PostGIS behaviour for
+                    // disjoint inputs).
+                    unsafe { writer.set_null(out_row) };
+                }
+                None => unsafe { writer.set_null(out_row) },
+            },
+            None => unsafe { writer.set_null(out_row) },
+        }
+    }
+}
+
+pub unsafe extern "C" fn intersection_destroy(states: *mut duckdb_aggregate_state, count: idx_t) {
+    unsafe { FfiState::<IntersectionAggState>::destroy_callback(states, count) };
 }
 
 // ---------------------------------------------------------------------------

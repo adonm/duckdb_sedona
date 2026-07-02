@@ -12,12 +12,18 @@
 //!
 //! The geometry-exploding core is plain Rust (no FFI), so it is unit-tested
 //! directly. The `bind` callback reads the BLOB geometry argument via the
-//! vendored `Value::as_blob`, runs the core, and stages `(path, wkb)` rows that
+//! `Value::as_blob`, runs the core, and stages `(path, wkb)` rows that
 //! `init`/`scan` stream back to DuckDB.
+//!
+//! All three scan callbacks are **parallel-safe** via an `AtomicUsize` cursor
+//! that atomically claims the next `vector_size`-row batch.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use geo_types::Geometry;
 use libduckdb_sys::{
-    duckdb_bind_info, duckdb_data_chunk, duckdb_function_info, duckdb_init_info, duckdb_vector_size,
+    duckdb_bind_info, duckdb_data_chunk, duckdb_function_info, duckdb_init_info,
 };
 use quack_rs::data_chunk::DataChunk;
 use quack_rs::table::{BindInfo, FfiBindData, FfiInitData, InitInfo};
@@ -336,13 +342,17 @@ unsafe fn read_geom_param(bi: &BindInfo, idx: u64, fn_name: &str) -> Option<Geom
     }
 }
 
+/// Shared scan state: an atomic cursor into an Arc-wrapped rows slice.
+/// Each DuckDB worker thread atomically claims the next `vector_size`-row
+/// batch — lock-free, no local-init needed.
+struct ScanCursor {
+    cursor: AtomicUsize,
+}
+
 // ----- ST_Dump -----------------------------------------------------------
 
 pub struct DumpBind {
-    pub rows: Vec<(String, Vec<u8>)>,
-}
-pub struct DumpScan {
-    pub cursor: usize,
+    rows: Arc<[(String, Vec<u8>)]>,
 }
 
 pub unsafe extern "C" fn dump_bind(info: duckdb_bind_info) {
@@ -358,49 +368,45 @@ pub unsafe extern "C" fn dump_bind(info: duckdb_bind_info) {
     bi.add_result_column("path", TypeId::Varchar)
         .add_result_column("geom", TypeId::Blob)
         .set_cardinality(rows.len() as u64, true);
-    unsafe { FfiBindData::<DumpBind>::set(info, DumpBind { rows }) };
+    unsafe { FfiBindData::<DumpBind>::set(info, DumpBind { rows: Arc::from(rows) }) };
 }
 
 pub unsafe extern "C" fn dump_init(info: duckdb_init_info) {
-    unsafe { InitInfo::new(info).set_max_threads(1) };
-    unsafe { FfiInitData::<DumpScan>::set(info, DumpScan { cursor: 0 }) };
+    unsafe { FfiInitData::<ScanCursor>::set(info, ScanCursor { cursor: AtomicUsize::new(0) }) };
 }
 
 pub unsafe extern "C" fn dump_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     let chunk = unsafe { DataChunk::from_raw(output) };
-    let cap = unsafe { duckdb_vector_size() } as usize;
+    let cap = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
     let Some(data) = (unsafe { FfiBindData::<DumpBind>::get_from_function(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let Some(state) = (unsafe { FfiInitData::<DumpScan>::get_mut(info) }) else {
+    let Some(state) = (unsafe { FfiInitData::<ScanCursor>::get(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let batch = data.rows.len().saturating_sub(state.cursor).min(cap);
-    if batch == 0 {
+    let start = state.cursor.fetch_add(cap, Ordering::Relaxed);
+    if start >= data.rows.len() {
         unsafe { chunk.set_size(0) };
         return;
     }
-    let mut c0 = unsafe { chunk.writer(0) };
-    let mut c1 = unsafe { chunk.writer(1) };
+    let batch = (data.rows.len() - start).min(cap);
+    let mut w0 = unsafe { chunk.writer(0) };
+    let mut w1 = unsafe { chunk.writer(1) };
     for i in 0..batch {
-        let (path, geom) = &data.rows[state.cursor + i];
-        unsafe { c0.write_varchar(i, path) };
-        unsafe { c1.write_blob(i, geom) };
+        let (path, geom) = &data.rows[start + i];
+        unsafe { w0.write_varchar(i, path) };
+        unsafe { w1.write_blob(i, geom) };
     }
-    state.cursor += batch;
     unsafe { chunk.set_size(batch) };
-    drop((c0, c1));
+    drop((w0, w1));
 }
 
 // ----- ST_DumpPoints -----------------------------------------------------
 
 pub struct DumpPointsBind {
-    pub rows: Vec<(String, i64, Vec<u8>)>,
-}
-pub struct DumpPointsScan {
-    pub cursor: usize,
+    rows: Arc<[(String, i64, Vec<u8>)]>,
 }
 
 pub unsafe extern "C" fn dump_points_bind(info: duckdb_bind_info) {
@@ -417,40 +423,39 @@ pub unsafe extern "C" fn dump_points_bind(info: duckdb_bind_info) {
         .add_result_column("npt", TypeId::BigInt)
         .add_result_column("geom", TypeId::Blob)
         .set_cardinality(rows.len() as u64, true);
-    unsafe { FfiBindData::<DumpPointsBind>::set(info, DumpPointsBind { rows }) };
+    unsafe { FfiBindData::<DumpPointsBind>::set(info, DumpPointsBind { rows: Arc::from(rows) }) };
 }
 
 pub unsafe extern "C" fn dump_points_init(info: duckdb_init_info) {
-    unsafe { InitInfo::new(info).set_max_threads(1) };
-    unsafe { FfiInitData::<DumpPointsScan>::set(info, DumpPointsScan { cursor: 0 }) };
+    unsafe { FfiInitData::<ScanCursor>::set(info, ScanCursor { cursor: AtomicUsize::new(0) }) };
 }
 
 pub unsafe extern "C" fn dump_points_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     let chunk = unsafe { DataChunk::from_raw(output) };
-    let cap = unsafe { duckdb_vector_size() } as usize;
+    let cap = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
     let Some(data) = (unsafe { FfiBindData::<DumpPointsBind>::get_from_function(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let Some(state) = (unsafe { FfiInitData::<DumpPointsScan>::get_mut(info) }) else {
+    let Some(state) = (unsafe { FfiInitData::<ScanCursor>::get(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let batch = data.rows.len().saturating_sub(state.cursor).min(cap);
-    if batch == 0 {
+    let start = state.cursor.fetch_add(cap, Ordering::Relaxed);
+    if start >= data.rows.len() {
         unsafe { chunk.set_size(0) };
         return;
     }
+    let batch = (data.rows.len() - start).min(cap);
     let mut c0 = unsafe { chunk.writer(0) };
     let mut c1 = unsafe { chunk.writer(1) };
     let mut c2 = unsafe { chunk.writer(2) };
     for i in 0..batch {
-        let (path, npt, geom) = &data.rows[state.cursor + i];
+        let (path, npt, geom) = &data.rows[start + i];
         unsafe { c0.write_varchar(i, path) };
         unsafe { c1.write_i64(i, *npt) };
         unsafe { c2.write_blob(i, geom) };
     }
-    state.cursor += batch;
     unsafe { chunk.set_size(batch) };
     drop((c0, c1, c2));
 }
@@ -458,10 +463,7 @@ pub unsafe extern "C" fn dump_points_scan(info: duckdb_function_info, output: du
 // ----- ST_DumpSegments ---------------------------------------------------
 
 pub struct DumpSegmentsBind {
-    pub rows: Vec<(String, Vec<u8>)>,
-}
-pub struct DumpSegmentsScan {
-    pub cursor: usize,
+    rows: Arc<[(String, Vec<u8>)]>,
 }
 
 pub unsafe extern "C" fn dump_segments_bind(info: duckdb_bind_info) {
@@ -477,38 +479,37 @@ pub unsafe extern "C" fn dump_segments_bind(info: duckdb_bind_info) {
     bi.add_result_column("path", TypeId::Varchar)
         .add_result_column("geom", TypeId::Blob)
         .set_cardinality(rows.len() as u64, true);
-    unsafe { FfiBindData::<DumpSegmentsBind>::set(info, DumpSegmentsBind { rows }) };
+    unsafe { FfiBindData::<DumpSegmentsBind>::set(info, DumpSegmentsBind { rows: Arc::from(rows) }) };
 }
 
 pub unsafe extern "C" fn dump_segments_init(info: duckdb_init_info) {
-    unsafe { InitInfo::new(info).set_max_threads(1) };
-    unsafe { FfiInitData::<DumpSegmentsScan>::set(info, DumpSegmentsScan { cursor: 0 }) };
+    unsafe { FfiInitData::<ScanCursor>::set(info, ScanCursor { cursor: AtomicUsize::new(0) }) };
 }
 
 pub unsafe extern "C" fn dump_segments_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
     let chunk = unsafe { DataChunk::from_raw(output) };
-    let cap = unsafe { duckdb_vector_size() } as usize;
+    let cap = unsafe { libduckdb_sys::duckdb_vector_size() } as usize;
     let Some(data) = (unsafe { FfiBindData::<DumpSegmentsBind>::get_from_function(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let Some(state) = (unsafe { FfiInitData::<DumpSegmentsScan>::get_mut(info) }) else {
+    let Some(state) = (unsafe { FfiInitData::<ScanCursor>::get(info) }) else {
         unsafe { chunk.set_size(0) };
         return;
     };
-    let batch = data.rows.len().saturating_sub(state.cursor).min(cap);
-    if batch == 0 {
+    let start = state.cursor.fetch_add(cap, Ordering::Relaxed);
+    if start >= data.rows.len() {
         unsafe { chunk.set_size(0) };
         return;
     }
+    let batch = (data.rows.len() - start).min(cap);
     let mut c0 = unsafe { chunk.writer(0) };
     let mut c1 = unsafe { chunk.writer(1) };
     for i in 0..batch {
-        let (path, geom) = &data.rows[state.cursor + i];
+        let (path, geom) = &data.rows[start + i];
         unsafe { c0.write_varchar(i, path) };
         unsafe { c1.write_blob(i, geom) };
     }
-    state.cursor += batch;
     unsafe { chunk.set_size(batch) };
     drop((c0, c1));
 }

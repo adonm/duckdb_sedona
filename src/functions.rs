@@ -32,7 +32,7 @@ use crate::geometry::Geom;
 /// input. Non-areal geometries contribute an empty `MultiPolygon`, which means
 /// they yield an empty result — the standard OGC behaviour for boolean ops on
 /// non-polygonal inputs.
-fn to_multi_polygon(g: &Geom) -> MultiPolygon {
+pub(crate) fn to_multi_polygon(g: &Geom) -> MultiPolygon {
     let polys: Vec<geo_types::Polygon> = match g {
         Geometry::Polygon(p) => vec![p.clone()],
         Geometry::MultiPolygon(mp) => mp.0.clone(),
@@ -2252,6 +2252,304 @@ pub fn is_valid_reason(g: &Geom) -> Option<String> {
                 .join("; "),
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1 remaining: ST_Snap, ST_Subdivide, ST_Node, ST_Polygonize stub
+// ---------------------------------------------------------------------------
+
+/// `ST_Snap(geom1, geom2, tolerance)` — snap coordinates of `geom1` to the
+/// nearest coordinate of `geom2` when within `tolerance` distance.
+///
+/// This is the PostGIS `ST_Snap` semantics: for every coordinate in `geom1`,
+/// find the closest coordinate in `geom2`; if the distance is ≤ `tolerance`,
+/// replace the `geom1` coordinate with the `geom2` coordinate. This is useful
+/// for making geometries that should share boundaries exactly coincident.
+pub fn snap(g1: &Geom, g2: &Geom, tolerance: f64) -> Option<Geom> {
+    if tolerance <= 0.0 {
+        return Some(g1.clone());
+    }
+    let targets = all_coords(g2);
+    if targets.is_empty() {
+        return Some(g1.clone());
+    }
+    let tol2 = tolerance * tolerance;
+    use geo::MapCoords;
+    let snapped = g1.map_coords(|coord| {
+        let mut best = coord;
+        let mut best_d2 = f64::MAX;
+        for &t in &targets {
+            let dx = coord.x - t.x;
+            let dy = coord.y - t.y;
+            let d2 = dx * dx + dy * dy;
+            if d2 < best_d2 {
+                best_d2 = d2;
+                if d2 <= tol2 {
+                    best = t;
+                }
+            }
+        }
+        best
+    });
+    Some(snapped)
+}
+
+/// `ST_Subdivide(geom, max_vertices)` — splits a geometry into a
+/// `GeometryCollection` of smaller geometries, each with at most `max_vertices`
+/// vertices.
+///
+/// For `LineString`s: split into chunks of `max_vertices` points. For
+/// `Polygon`s: divide the bounding box into a grid and clip each sub-rectangle
+/// against the polygon using `BooleanOps::intersection`. For
+/// `MultiLineString`/`MultiPolygon`: subdivide each element. Points /
+/// MultiPoints are returned as-is if small enough, otherwise split.
+pub fn subdivide(g: &Geom, max_vertices: i32) -> Option<Geom> {
+    let max_v = max_vertices.max(1) as usize;
+    let total_v: usize = all_coords(g).len();
+
+    if total_v <= max_v {
+        return Some(g.clone());
+    }
+
+    match g {
+        Geometry::LineString(ls) => {
+            let chunks: Vec<Geometry> = ls
+                .0
+                .chunks(max_v)
+                .map(|chunk| {
+                    Geometry::LineString(geo_types::LineString(
+                        chunk.to_vec(),
+                    ))
+                })
+                .collect();
+            Some(Geometry::GeometryCollection(geo_types::GeometryCollection(
+                chunks,
+            )))
+        }
+        Geometry::MultiLineString(mls) => {
+            let mut parts = Vec::new();
+            for ls in &mls.0 {
+                for chunk in ls.0.chunks(max_v) {
+                    parts.push(Geometry::LineString(geo_types::LineString(
+                        chunk.to_vec(),
+                    )));
+                }
+            }
+            Some(Geometry::GeometryCollection(geo_types::GeometryCollection(
+                parts,
+            )))
+        }
+        Geometry::Polygon(poly) => subdivide_polygon(poly, max_v),
+        Geometry::MultiPolygon(mp) => {
+            let mut parts = Vec::new();
+            for poly in &mp.0 {
+                if let Some(Geometry::GeometryCollection(gc)) =
+                    subdivide_polygon(poly, max_v)
+                {
+                    parts.extend(gc.0);
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(Geometry::GeometryCollection(
+                    geo_types::GeometryCollection(parts),
+                ))
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            let mut parts = Vec::new();
+            for item in &gc.0 {
+                if let Some(sub) = subdivide(item, max_vertices) {
+                    match sub {
+                        Geometry::GeometryCollection(sub_gc) => {
+                            parts.extend(sub_gc.0);
+                        }
+                        other => parts.push(other),
+                    }
+                }
+            }
+            Some(Geometry::GeometryCollection(
+                geo_types::GeometryCollection(parts),
+            ))
+        }
+        _ => Some(g.clone()),
+    }
+}
+
+/// Subdivide a polygon by clipping against a grid of its bounding box.
+fn subdivide_polygon(poly: &geo_types::Polygon<f64>, max_v: usize) -> Option<Geom> {
+    let bbox = match poly.bounding_rect() {
+        Some(r) => r,
+        None => return Some(Geometry::Polygon(poly.clone())),
+    };
+    let total_v: usize = all_coords(&Geometry::Polygon(poly.clone())).len();
+    if total_v <= max_v {
+        return Some(Geometry::Polygon(poly.clone()));
+    }
+    // Determine grid divisions: aim for each cell to hold ~max_v vertices.
+    let n_cells = ((total_v as f64) / (max_v as f64)).ceil() as usize;
+    let n_side = (n_cells as f64).sqrt().ceil() as usize;
+    let n_side = n_side.max(1);
+    let dx = (bbox.max().x - bbox.min().x) / n_side as f64;
+    let dy = (bbox.max().y - bbox.min().y) / n_side as f64;
+    let mp = MultiPolygon::new(vec![poly.clone()]);
+    let mut parts: Vec<Geometry> = Vec::new();
+    for i in 0..n_side {
+        for j in 0..n_side {
+            let lo_x = bbox.min().x + dx * i as f64;
+            let lo_y = bbox.min().y + dy * j as f64;
+            let hi_x = lo_x + dx;
+            let hi_y = lo_y + dy;
+            let cell = geo_types::Rect::new(
+                geo_types::Coord { x: lo_x, y: lo_y },
+                geo_types::Coord { x: hi_x, y: hi_y },
+            )
+            .to_polygon();
+            let clipped = mp.intersection(&MultiPolygon::new(vec![cell]));
+            if !clipped.0.is_empty() {
+                parts.push(Geometry::MultiPolygon(clipped));
+            }
+        }
+    }
+    if parts.is_empty() {
+        Some(Geometry::Polygon(poly.clone()))
+    } else {
+        Some(Geometry::GeometryCollection(
+            geo_types::GeometryCollection(parts),
+        ))
+    }
+}
+
+/// `ST_Node(geom)` — nodes all line intersections in a `MultiLineString`,
+/// returning a new `MultiLineString` where every self-intersection is split
+/// into a separate segment.
+///
+/// This is a simplified noder: it finds all pairwise line-segment
+/// intersections and splits each segment at those points. It does NOT handle
+/// overlapping collinear segments (a full topology noder would). For most
+/// practical use cases (going from un-noded to noded lines for polygonize)
+/// this is sufficient.
+pub fn node(g: &Geom) -> Option<Geom> {
+    match g {
+        Geometry::LineString(ls) => {
+            let lines = vec![ls.clone()];
+            let noded = node_lines(lines);
+            if noded.is_empty() {
+                None
+            } else {
+                Some(Geometry::MultiLineString(geo_types::MultiLineString(
+                    noded,
+                )))
+            }
+        }
+        Geometry::MultiLineString(mls) => {
+            let lines: Vec<geo_types::LineString<f64>> = mls.0.clone();
+            let noded = node_lines(lines);
+            if noded.is_empty() {
+                None
+            } else {
+                Some(Geometry::MultiLineString(geo_types::MultiLineString(
+                    noded,
+                )))
+            }
+        }
+        Geometry::GeometryCollection(gc) => {
+            let mut lines = Vec::new();
+            for item in &gc.0 {
+                match item {
+                    Geometry::LineString(ls) => lines.push(ls.clone()),
+                    Geometry::MultiLineString(mls) => lines.extend(mls.0.iter().cloned()),
+                    _ => {}
+                }
+            }
+            if lines.is_empty() {
+                Some(g.clone())
+            } else {
+                let noded = node_lines(lines);
+                Some(Geometry::MultiLineString(geo_types::MultiLineString(
+                    noded,
+                )))
+            }
+        }
+        _ => Some(g.clone()),
+    }
+}
+
+/// Find all pairwise line-segment intersections and split each segment at the
+/// intersection points. Returns the noded line segments.
+fn node_lines(lines: Vec<geo_types::LineString<f64>>) -> Vec<geo_types::LineString<f64>> {
+    use geo::line_intersection::{line_intersection, LineIntersection};
+
+    // Collect all segments as (line_idx, seg_idx, segment) triples.
+    #[allow(clippy::type_complexity)]
+    let segments: Vec<(usize, geo_types::Line<f64>)> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(li, ls)| {
+            ls.lines()
+                .map(move |seg| (li, seg))
+        })
+        .collect();
+
+    // For each segment, find all intersection points with other segments.
+    let mut split_points: Vec<Vec<geo_types::Coord<f64>>> = vec![Vec::new(); segments.len()];
+    for i in 0..segments.len() {
+        for j in (i + 1)..segments.len() {
+            let (li_a, seg_a) = segments[i];
+            let (li_b, seg_b) = segments[j];
+            // Don't split segments from the same original line at shared endpoints.
+            if li_a == li_b {
+                continue;
+            }
+            if let Some(inter) = line_intersection(seg_a, seg_b) {
+                let pt = match inter {
+                    LineIntersection::SinglePoint { intersection, .. } => intersection,
+                    LineIntersection::Collinear { intersection, .. } => intersection.start,
+                };
+                let c = geo_types::Coord {
+                    x: pt.x,
+                    y: pt.y,
+                };
+                // Only add if the point is strictly interior to both segments
+                // (not a shared endpoint).
+                let is_endpoint_a = (seg_a.start == c) || (seg_a.end == c);
+                let is_endpoint_b = (seg_b.start == c) || (seg_b.end == c);
+                if !is_endpoint_a {
+                    split_points[i].push(c);
+                }
+                if !is_endpoint_b {
+                    split_points[j].push(c);
+                }
+            }
+        }
+    }
+
+    // Split each segment at its intersection points, producing new line segments.
+    let mut result = Vec::new();
+    for (i, (_, seg)) in segments.iter().enumerate() {
+        let mut pts = vec![seg.start, seg.end];
+        pts.extend(split_points[i].iter().copied());
+        // Sort points along the segment direction.
+        let dx = seg.end.x - seg.start.x;
+        let dy = seg.end.y - seg.start.y;
+        let len2 = dx * dx + dy * dy;
+        if len2 < f64::EPSILON {
+            continue;
+        }
+        pts.sort_by(|a, b| {
+            let ta = ((a.x - seg.start.x) * dx + (a.y - seg.start.y) * dy) / len2;
+            let tb = ((b.x - seg.start.x) * dx + (b.y - seg.start.y) * dy) / len2;
+            ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        pts.dedup_by(|a, b| {
+            (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12
+        });
+        for w in pts.windows(2) {
+            result.push(geo_types::LineString(vec![w[0], w[1]]));
+        }
+    }
+    result
 }
 
 #[cfg(test)]

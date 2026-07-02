@@ -114,3 +114,9 @@ SELECT CASE WHEN st_isvalidreason(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 1,0 0)
 
 -- === Aggregate: ST_MakeLine ===
 SELECT CASE WHEN st_astext(st_makeline_agg(g ORDER BY k)) = 'LINESTRING(0 0,1 1,2 2)' THEN 'PASS' ELSE 'FAIL makeline_agg' FROM (SELECT 0 k, st_point(0,0) g UNION ALL SELECT 1, st_point(1,1) UNION ALL SELECT 2, st_point(2,2));
+
+-- === Tier 1 remaining: ST_Snap, ST_Subdivide, ST_Node, ST_Intersection agg ===
+SELECT CASE WHEN st_astext(st_snap(st_geomfromtext('POINT(0.001 0)'), st_geomfromtext('POINT(0 0)'), 0.01)) = 'POINT(0 0)' THEN 'PASS' ELSE 'FAIL snap' END;
+SELECT CASE WHEN st_numgeometries(st_subdivide(st_geomfromtext('LINESTRING(0 0,1 1,2 2,3 3,4 4,5 5)'),2)) >= 2 THEN 'PASS' ELSE 'FAIL subdivide' END;
+SELECT CASE WHEN st_geometrytype(st_node(st_geomfromtext('MULTILINESTRING((0 0,2 2),(2 0,0 2))'))) = 'ST_MultiLineString' THEN 'PASS' ELSE 'FAIL node' END;
+SELECT CASE WHEN st_area(st_intersection_agg(g)) = 4.0 THEN 'PASS' ELSE 'FAIL intersection_agg' FROM (SELECT st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))') g UNION ALL SELECT st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))'));

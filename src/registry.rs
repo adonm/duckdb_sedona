@@ -200,6 +200,29 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
         }};
     }
 
+    // -- (Geometry, Geometry, DOUBLE) -> Geometry --------------------------
+    macro_rules! register_geom_geom_double_to_geom {
+        ($name:expr, $func:path) => {{
+            unsafe extern "C" fn cb(
+                _info: duckdb_function_info,
+                input: duckdb_data_chunk,
+                output: duckdb_vector,
+            ) {
+                dispatch::geom_geom_double_to_geom(input, output, $func);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+
     // -- Geometry -> INTEGER ------------------------------------------------
     macro_rules! register_geom_int {
         ($name:expr, $func:path) => {{
@@ -481,6 +504,11 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_unary_geom!("st_delaunaytriangles", functions::delaunay_triangles);
     register_unary_geom!("st_voronoilines", functions::voronoi_lines);
 
+    // --- Tier 1 remaining: ST_Snap, ST_Subdivide, ST_Node ------------------
+    register_geom_geom_double_to_geom!("st_snap", functions::snap);
+    register_geom_int_to_geom!("st_subdivide", functions::subdivide);
+    register_unary_geom!("st_node", functions::node);
+
     // --- Tier 1/1b parity batch: editing, transforms, measurements ---------
     register_geom_double6_to_geom!("st_affine", functions::affine);
     register_geom_double_to_geom!("st_segmentize", functions::segmentize);
@@ -624,6 +652,20 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .combine(dispatch::union_combine)
             .finalize(dispatch::union_finalize)
             .destructor(dispatch::union_destroy)
+            .register(con)?;
+    }
+
+    // --- aggregate: ST_Intersection (cascaded polygonal intersection) ----
+    unsafe {
+        AggregateFunctionBuilder::new("st_intersection_agg")
+            .param(TypeId::Blob)
+            .returns(TypeId::Blob)
+            .state_size(dispatch::intersection_state_size)
+            .init(dispatch::intersection_state_init)
+            .update(dispatch::intersection_update)
+            .combine(dispatch::intersection_combine)
+            .finalize(dispatch::intersection_finalize)
+            .destructor(dispatch::intersection_destroy)
             .register(con)?;
     }
 
