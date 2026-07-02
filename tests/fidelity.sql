@@ -82,3 +82,52 @@ SELECT CASE WHEN abs(st_length(st_linesubstring(g,0.0,0.5)) - st_length(sedona_s
             THEN 'PASS' ELSE 'FAIL linesubstring' END FROM ln;
 -- ST_AsBinary: both must return identical WKB bytes for the same geometry
 SELECT CASE WHEN st_asbinary(st_geomfromtext('POINT(1 2)')) = sedona_st_asbinary(st_geomfromtext('POINT(1 2)')) THEN 'PASS' ELSE 'FAIL asbinary' END;
+
+-- === P1 round 2: transforms / extraction / serialization ===
+-- ST_StartPoint / ST_EndPoint on a line (compare by coordinate text)
+WITH ln AS (SELECT st_geomfromtext('LINESTRING(0 0,1 1,2 2,3 3)') AS g)
+SELECT CASE WHEN st_astext(st_startpoint(g)) = st_astext(sedona_st_startpoint(g))
+              AND st_astext(st_endpoint(g)) = st_astext(sedona_st_endpoint(g))
+            THEN 'PASS' ELSE 'FAIL startpoint/endpoint' END FROM ln;
+
+-- ST_Reverse (compare vertex order on a line)
+WITH ln AS (SELECT st_geomfromtext('LINESTRING(0 0,1 1,2 2)') AS g)
+SELECT CASE WHEN st_astext(st_reverse(g)) = st_astext(sedona_st_reverse(g))
+            THEN 'PASS' ELSE 'FAIL reverse' END FROM ln;
+
+-- ST_FlipCoordinates (swap x/y on a point)
+WITH pt AS (SELECT st_geomfromtext('POINT(3 7)') AS g)
+SELECT CASE WHEN st_astext(st_flipcoordinates(g)) = st_astext(sedona_st_flipcoordinates(g))
+            THEN 'PASS' ELSE 'FAIL flipcoordinates' END FROM pt;
+
+-- ST_Force2D (strip Z from a 3D point — bridge constructors produce Z geom)
+WITH zpt AS (SELECT sedona_st_pointz(1, 2, 3) AS g)
+SELECT CASE WHEN st_zmflag(st_force2d(g)) = 0 AND st_zmflag(sedona_st_force2d(g)) = 0
+            THEN 'PASS' ELSE 'FAIL force2d' END FROM zpt;
+
+-- ST_Points (extract all vertices as MultiPoint)
+WITH poly AS (SELECT st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))') AS g)
+SELECT CASE WHEN st_numpoints(st_points(g)) = st_numpoints(sedona_st_points(g))
+            THEN 'PASS' ELSE 'FAIL points' END FROM poly;
+
+-- ST_AsEWKB (identical WKB bytes)
+SELECT CASE WHEN st_asewkb(st_geomfromtext('POINT(1 2)')) = sedona_st_asewkb(st_geomfromtext('POINT(1 2)'))
+            THEN 'PASS' ELSE 'FAIL asewkb' END;
+
+-- ST_SRID (both return 0 for SRID-less geometries)
+SELECT CASE WHEN st_srid(st_geomfromtext('POINT(1 2)')) = sedona_st_srid(st_geomfromtext('POINT(1 2)'))
+            THEN 'PASS' ELSE 'FAIL srid' END;
+
+-- ST_Segmentize (compare by numpoints — vertex insertion count must match)
+WITH ln AS (SELECT st_geomfromtext('LINESTRING(0 0,10 0)') AS g)
+SELECT CASE WHEN st_numpoints(st_segmentize(g, 3.0)) = st_numpoints(sedona_st_segmentize(g, 3.0))
+            THEN 'PASS' ELSE 'FAIL segmentize' END FROM ln;
+
+-- ST_SetSRID (both tag the SRID; compare by st_srid read-back)
+WITH pt AS (SELECT st_geomfromtext('POINT(1 2)') AS g)
+SELECT CASE WHEN st_srid(st_setsrid(g, 4326)) = sedona_st_srid(sedona_st_setsrid(g, 4326))
+            THEN 'PASS' ELSE 'FAIL setsrid' END FROM pt;
+
+-- === PostGIS namespace aliases (same kernel, two names) ===
+SELECT CASE WHEN st_astext(st_geometryfromtext('POINT(1 2)')) = 'POINT(1 2)'
+            THEN 'PASS' ELSE 'FAIL st_geometryfromtext alias' END;

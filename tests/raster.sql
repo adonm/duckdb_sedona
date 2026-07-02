@@ -37,3 +37,20 @@ FROM st_pixeldata('tests/data/test_raster.asc', 1);
 -- Arithmetic: sum of value*2 = 2*(1+2+...+12) = 156
 SELECT CASE WHEN sum(value * 2) = 156 THEN 'PASS' ELSE 'FAIL mapalgebra-arith' END
 FROM st_pixeldata('tests/data/test_raster.asc', 1);
+
+-- st_raster_transform: geotransform + computed bounds
+-- Test raster is 4×3 at origin (0,3) with pixel size (1,-1) → bounds (0,0,4,3)
+SELECT CASE WHEN xmin = 0.0 AND ymin = 0.0 AND xmax = 4.0 AND ymax = 3.0
+                 AND origin_x = 0.0 AND origin_y = 3.0
+                 AND pixel_w = 1.0 AND pixel_h = -1.0
+            THEN 'PASS' ELSE 'FAIL raster-transform' END
+FROM st_raster_transform('tests/data/test_raster.asc');
+
+-- Pixel-to-geographic coordinate conversion using the transform
+-- (col=2, row=1) → x = origin_x + col*pixel_w = 0 + 2*1 = 2
+--                  y = origin_y + row*pixel_h = 3 + 1*(-1) = 2
+SELECT CASE WHEN abs(
+    (SELECT origin_x FROM st_raster_transform('tests/data/test_raster.asc')) +
+    2 * (SELECT pixel_w FROM st_raster_transform('tests/data/test_raster.asc'))
+    - 2.0) < 1e-9
+            THEN 'PASS' ELSE 'FAIL pixel-to-geo' END;

@@ -490,6 +490,31 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
                 .null_handling(NullHandling::SpecialNullHandling)
                 .function(st_voronoipolygons_cb).register(con)?;
         }
+        // ST_Snap (geom, geom, DOUBLE) -> geom — GEOS snap (canonical PostGIS engine)
+        unsafe extern "C" fn st_snap_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) {
+            dispatch::binary_wkb_double(input, output, crate::geos_backend::snap);
+        }
+        unsafe {
+            ScalarFunctionBuilder::new("st_snap")
+                .param(TypeId::Blob).param(TypeId::Blob).param(TypeId::Double)
+                .returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_snap_cb).register(con)?;
+        }
+        // ST_MakeValid (geom) -> geom — GEOS MakeValid (canonical PostGIS engine)
+        unsafe extern "C" fn st_makevalid_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) {
+            dispatch::unary_wkb(input, output, crate::geos_backend::make_valid);
+        }
+        unsafe {
+            ScalarFunctionBuilder::new("st_makevalid")
+                .param(TypeId::Blob).returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_makevalid_cb).register(con)?;
+        }
     }
 
     register_predicate!("st_intersects", functions::intersects);
@@ -527,34 +552,31 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // literal-backed — see the bridge batch below.
     register_geom_int!("st_numinteriorrings", functions::num_interior_rings);
     register_geom_int!("st_coorddim", functions::coord_dim);
-    register_geom_int!("st_zmflag", functions::zm_flag);
-    register_geom_int!("st_srid", functions::srid);
+    // st_zmflag / st_srid are now literal-backed — see bridge batch below.
 
     register_unary_geom!("st_exteriorring", functions::exterior_ring);
-    register_unary_geom!("st_startpoint", functions::start_point);
-    register_unary_geom!("st_endpoint", functions::end_point);
+    // st_startpoint / st_endpoint are now literal-backed — see bridge batch.
     register_unary_geom!("st_pointonsurface", functions::point_on_surface);
-    register_unary_geom!("st_asbinary", functions::geom_from_wkb);
-    register_unary_geom!("st_makevalid", functions::make_valid);
-    register_unary_geom!("st_force2d", functions::force_2d);
-    register_unary_geom!("st_reverse", functions::reverse_geom);
-    register_unary_geom!("st_flipcoordinates", functions::flip_coordinates);
+    // st_asbinary is now literal-backed — see bridge batch.
+    // st_makevalid is now GEOS-backed — see topology batch below.
+    // st_force2d / st_reverse / st_flipcoordinates / st_points are now
+    // literal-backed — see bridge batch.
     register_unary_geom!("st_removerepeatedpoints", functions::remove_repeated_points);
     register_unary_geom!("st_orientedenvelope", functions::oriented_envelope);
-    register_unary_geom!("st_points", functions::points);
+    // st_points moved to literal batch above.
     register_unary_geom!("st_boundary", functions::boundary);
     register_unary_geom!("st_forcepolygoncw", functions::force_polygon_cw);
     register_unary_geom!("st_delaunaytriangles", functions::delaunay_triangles);
     register_unary_geom!("st_voronoilines", functions::voronoi_lines);
 
-    // --- Tier 1 remaining: ST_Snap, ST_Subdivide, ST_Node ------------------
-    register_geom_geom_double_to_geom!("st_snap", functions::snap);
+    // --- Tier 1 remaining: ST_Subdivide, ST_Node ------------------
+    // st_snap is now GEOS-backed — see topology batch below.
     register_geom_int_to_geom!("st_subdivide", functions::subdivide);
     // st_node is now GEOS-backed (canonical PostGIS-grade topology, line ~451).
 
     // --- Tier 1/1b parity batch: editing, transforms, measurements ---------
     register_geom_double6_to_geom!("st_affine", functions::affine);
-    register_geom_double_to_geom!("st_segmentize", functions::segmentize);
+    // st_segmentize is now literal-backed — see bridge batch.
     register_geom_double2_to_geom!("st_linesubstring", functions::line_substring);
     register_unary_geom!("st_linemerge", functions::line_merge);
     register_geom_int_to_geom!("st_collectionextract", functions::collection_extract);
@@ -573,8 +595,9 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_geom_bool!("st_ispoint", functions::is_point);
     register_geom_bool!("st_islinestring", functions::is_linestring);
     register_geom_bool!("st_ispolygon", functions::is_polygon);
-    register_unary_geom!("st_asewkb", functions::geom_from_wkb); // SRID-less: EWKB == WKB
-    register_unary_geom!("st_geomfromewkb", functions::geom_from_wkb); // EWKB-tolerant from_wkb
+    // st_asewkb / st_geomfromewkb: asewkb is now literal-backed; geomfromewkb
+    // stays local (it is a trust-boundary constructor, not a serialization).
+    register_unary_geom!("st_geomfromewkb", functions::geom_from_wkb);
     register_geom_varchar!("st_ashexewkb", functions::as_hex_ewkb);
 
     // --- Tier 1/1b parity batch round 2: constructors, editing, measurement ---
@@ -591,10 +614,12 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_geom_varchar!("st_isvalidreason", functions::is_valid_reason);
 
     // (geom, int) -> geom
+    // st_geometryn / st_pointn / st_interiorringn remain local for now (their
+    // literal twins require the integer to be a non-constant column in some
+    // edge cases). st_setsrid is now literal-backed — see bridge batch.
     register_geom_int_to_geom!("st_geometryn", functions::geometry_n);
     register_geom_int_to_geom!("st_pointn", functions::point_n);
     register_geom_int_to_geom!("st_interiorringn", functions::interior_ring_n);
-    register_geom_int_to_geom!("st_setsrid", functions::set_srid);
 
     // (geom, int, int) -> geom  (CRS reprojection via PROJ)
     register_geom_int2_to_geom!("st_transform", functions::transform);
@@ -606,6 +631,7 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
 
     // --- constructors & mixed-type --------------------------------------
     register_str_geom!("st_geomfromtext", functions::geom_from_text);
+    register_str_geom!("st_geometryfromtext", functions::geom_from_text); // PostGIS alias
     register_str_geom!("st_geomfromewkt", functions::geom_from_ewkt);
     register_str_geom!("st_linefromtext", functions::geom_from_text);
     register_str_geom!("st_pointfromtext", functions::geom_from_text);
@@ -775,6 +801,12 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .bind(crate::raster::pixeldata_bind)
             .init(crate::raster::pixeldata_init)
             .scan(crate::raster::pixeldata_scan)
+            .register(con)?;
+        TableFunctionBuilder::new("st_raster_transform")
+            .param(TypeId::Varchar)
+            .bind(crate::raster::raster_transform_bind)
+            .init(crate::raster::raster_transform_init)
+            .scan(crate::raster::raster_transform_scan)
             .register(con)?;
     }
 
@@ -1292,6 +1324,25 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // (geom -> geom) — bounding rectangle (compared by area in fidelity.sql;
     // ring winding may legitimately differ CCW/CW).
     register_sedona_blob_blob!("st_envelope", "st_envelope");
+
+    // --- P1 round 2: route proven-equivalent transforms / serializers /
+    // accessors to the literal kernel (fidelity.sql proves local == literal). ---
+    // (geom -> geom) — geometry transforms
+    register_sedona_blob_blob!("st_startpoint", "st_startpoint");
+    register_sedona_blob_blob!("st_endpoint", "st_endpoint");
+    register_sedona_blob_blob!("st_reverse", "st_reverse");
+    register_sedona_blob_blob!("st_flipcoordinates", "st_flipcoordinates");
+    register_sedona_blob_blob!("st_force2d", "st_force2d");
+    register_sedona_blob_blob!("st_points", "st_points");
+    register_sedona_blob_blob!("st_asbinary", "st_asbinary");
+    register_sedona_blob_blob!("st_asewkb", "st_asewkb");
+    // (geom -> INTEGER)
+    register_sedona_blob_int!("st_zmflag", "st_zmflag");
+    register_sedona_blob_int!("st_srid", "st_srid");
+    // (geom, DOUBLE) -> geom — segmentize
+    register_sedona_blob_double_blob!("st_segmentize", "st_segmentize");
+    // (geom, INTEGER) -> geom — set SRID
+    register_sedona_blob_int_blob!("st_setsrid", "st_setsrid");
     // (geom, DOUBLE×6) -> geom — ST_Affine 2D (a,b,d,e,xOff,yOff).
     register_sedona_blob_double6_blob!("sedona_st_affine", "st_affine");
     // (geom -> VARCHAR crs) — unary CRS extractor (ST_CRS / ST_SRID crs form).

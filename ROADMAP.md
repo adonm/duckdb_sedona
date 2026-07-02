@@ -1,12 +1,16 @@
-# Roadmap to a SedonaDB + PostGIS superset
+# Roadmap to a highest-fidelity SedonaDB + PostGIS superset
 
 Status of the `sedonadb` DuckDB extension against the Apache SedonaDB and
-PostGIS spatial surfaces, and what it takes to reach a **highest-fidelity,
-usable, maintainable superset**.
+PostGIS spatial surfaces, and the plan to keep it focused, usable, and
+maintainable while moving toward a practical superset.
 
 ## North-star target
 
-Build the best spatial extension for DuckDB by combining three goals:
+Build the highest-quality spatial engine for DuckDB: a practical **superset of
+Apache SedonaDB and the commonly-used PostGIS analysis surface**, under a SQL
+namespace that is as close as possible to `ST_*` PostGIS/SedonaDB conventions.
+
+The target is deliberately ambitious but narrow enough to stay maintainable:
 
 1. **SedonaDB superset, literal by default.** Every Apache SedonaDB SQL kernel
    that can be bridged safely should be callable in DuckDB and should be the
@@ -17,26 +21,30 @@ Build the best spatial extension for DuckDB by combining three goals:
    argument order, units, NULL behavior, and edge-case semantics. Where DuckDB,
    SedonaDB, Rust libraries, or missing infrastructure make exact PostGIS
    behavior impossible, document the mismatch and test it explicitly.
-3. **Production quality over catalog inflation.** Never ship a function that can
+3. **Highest fidelity over catalog inflation.** Never ship a function that can
    silently return wrong geometry. Prefer `NULL`, a documented limitation, or an
    unimplemented item over approximate behavior that looks authoritative.
+4. **DuckDB-native usability.** Spatial workflows should feel natural in DuckDB:
+   vectorized chunk execution, WKB interop with DuckDB `spatial`, table functions
+   for set-returning/raster/join workflows, and SQL as the composition language.
+5. **Maintainable growth.** New capability should expand shared executor families
+   or narrow backend boundaries (Sedona bridge, GEOS, GDAL, PROJ, GeographicLib),
+   not add one-off semantic snowflakes.
 
-Practical namespace policy:
+## SQL namespace policy
 
-- `st_*`: the user-facing, PostGIS/SedonaDB-like SQL namespace. If Apache
-  SedonaDB has the function and the bridge supports its signature, `st_*` should
-  route to the literal SedonaDB kernel or be proven equivalent before remaining
-  local.
-- `sedona_st_*`: explicit literal Apache SedonaDB bridge functions, useful to
-  users, tests, and migration/debugging. These make the provenance visible while
-  `st_*` remains the ergonomic namespace.
-- extension-specific names (`sedona_join`, `*_crs` helpers, benchmarks/tools)
-  are allowed when DuckDB needs a different shape than PostGIS/SedonaDB.
+- `st_*`: the user-facing namespace. Match PostGIS/SedonaDB names, arities,
+  argument order, units, and NULL behavior wherever feasible.
+- `sedona_st_*`: explicit literal Apache SedonaDB bridge functions. These are
+  useful to users, tests, migration/debugging, and fidelity comparisons.
+- Extension-specific helpers (`sedona_join`, `*_crs`, benchmarks/tools) are
+  allowed when DuckDB needs a different shape than PostGIS/SedonaDB, but should be
+  documented as DuckDB-native workflow helpers rather than compatibility claims.
 
 Implementation policy:
 
-- Do **not** maintain two independent implementations for the same semantics as
-  a permanent state. Once a SedonaDB bridge kernel is supported and validated,
+- Do **not** maintain two independent implementations for the same semantics as a
+  permanent state. Once a SedonaDB bridge kernel is supported and validated,
   prefer routing the public `st_*` function to it.
 - Keep local Rust implementations for: functions SedonaDB lacks, PostGIS-compat
   capabilities beyond SedonaDB, DuckDB-specific table/aggregate shapes, bridge
@@ -44,8 +52,12 @@ Implementation policy:
 - If a local implementation overlaps SedonaDB, either deprecate it internally,
   convert it into a thin wrapper over the bridge, or document why it intentionally
   diverges.
+- Backend choices should be boring and canonical: Apache SedonaDB for SedonaDB
+  kernels, GEOS for planar topology, GeographicLib/Karney for spheroid geodesics,
+  PROJ for CRS transforms, GDAL for raster I/O, and DuckDB SQL for relational/map
+  algebra.
 
-Quality gates for new capabilities:
+## Quality gates for every new capability
 
 - **Fidelity first:** add local-vs-literal SedonaDB tests when a bridged kernel
   exists; add PostGIS/SedonaDB reference fixtures for hard edge cases otherwise.
@@ -54,184 +66,79 @@ Quality gates for new capabilities:
 - **Vectorized and packageable:** every feature must work through DuckDB chunks,
   SQL regressions, release packaging, and the smoke test.
 - **Maintainable by design:** prefer one registry line plus a shared executor;
-  keep FFI, Arrow, GDAL/PROJ, and topology code isolated behind small boundaries.
+  keep FFI, Arrow, GDAL/PROJ, GEOS, and topology code isolated behind small
+  boundaries.
 - **Usable docs:** every non-obvious semantic difference, runtime dependency, and
-  extension-specific helper needs a short README/ROADMAP note and at least one
-  SQL example or regression.
+  extension-specific helper needs a short README/ROADMAP note and at least one SQL
+  example or regression.
 
-## Where we are now (~130 functions, all on the `geo`/`wkb` stack)
+## Where we are now
 
-Constructors & I/O (incl. EWKT **and EWKB**) · accessors · DE-9IM predicates ·
-measurements (incl. `ST_MaxDistance`/`ST_LongestLine`/`ST_ShortestLine`/
-`ST_MinimumClearance`/`MinimumClearanceLine`) · boolean set ops ·
-affine/simplify/segmentize transforms · `ST_MakeValid` robustness · four
-aggregates (`ST_Collect`, `ST_Envelope` agg, `ST_Union` agg, `ST_MakeLine` agg)
-· `ST_DWithin` · bbox accessors (join prefilter) · a custom robust
-point-in-polygon · **geodesic/geography**
-(`ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere`) · EWKT/EWKB/SRID
-stubs · typed WKT constructors · `ST_Points/LineLocatePoint/Frechet/\
-ClosestPoint/Hausdorff/FlipCoordinates/Reverse/RemoveRepeatedPoints/\
-OrientedEnvelope` · `ST_Affine`(6-param)/`ST_Segmentize`/`ST_LineSubstring`/
-`ST_LineMerge`/`ST_CollectionExtract`/`ST_ForceCollection`/`ST_Multi`/
-`ST_Normalize`/`ST_ForceRHR`/`ST_ForcePolygonCW`/`ST_ForcePolygonCCW`/
-`ST_TriangulatePolygon`/`ST_OrderingEquals`/`ST_NRings` ·
-`ST_MakeEnvelope`/`ST_MakePolygon`/`ST_RemovePoint`/`ST_AddPoint`/
-`ST_SimplifyPreserveTopology`/`ST_MinimumBoundingCircle`/`ST_GeneratePoints`/
-`ST_IsValidReason` · **`ST_Dump`/`ST_DumpPoints`/`ST_DumpSegments`** set-returning
-table functions. Verified end-to-end in DuckDB 1.5.4 over a local DuckLake and
-Apache SpatialBench (`benchmarks/BENCHMARKS.md`).
+The extension already has a broad vector/geography/raster surface over WKB BLOBs:
 
-**Literal Apache SedonaDB now linked.** Beyond the reimplementation above,
-`src/bridge.rs` invokes the real `sedona-functions` DataFusion UDF kernels
-directly from DuckDB (DuckDB-chunk ⇄ Arrow bridge); 47 `sedona_*` functions
-are registered side-by-side with ours and runtime-verified, including CRS-tagged
-returns (item-crs structs unwrapped to WKB at the extension's native fidelity),
-a CRS sidecar extractor (`sedona_st_geomfromewkt_crs`), and constant-scalar
-argument detection. Bridge overhead is negligible (benchmarks/bridge.sql: literal
-path competitive with the local reimplementation). See "Resolved #1" below.
+- Constructors and I/O: WKT/WKB/EWKT/EWKB, typed WKT/WKB constructors, point/Z/M
+  constructors, GeoJSON/HexEWKB output.
+- Accessors and predicates: dimension, points/geometries/rings, XY/ZM accessors,
+  bbox accessors, DE-9IM predicates, validity checks, ordering equality.
+- Measurements and processing: area/length/distance/perimeter, Hausdorff/Frechet,
+  max/longest/shortest line, affine/editing transforms, simplify/segmentize,
+  hulls/oriented envelope, triangulation, make-valid, minimum clearance/circle.
+- Aggregates and set-returning functions: collect/union/envelope/makeline
+  aggregates plus `ST_Dump`, `ST_DumpPoints`, and `ST_DumpSegments`.
+- CRS/geography: `ST_Transform`, sphere geodesics, WGS84 spheroid geodesics.
+- Hard algorithms: GEOS-backed `ST_Node`, `ST_Polygonize`, `ST_BuildArea`,
+  `ST_VoronoiPolygons`, `ST_Snap`, and `ST_MakeValid`.
+- Raster: `st_raster_info`, `st_raster_stats`, `st_raster_transform`, and
+  `st_pixeldata(path, band)` for DuckDB-native map algebra.
 
-## Previously-flagged hard bits — now resolved
+**Literal Apache SedonaDB is linked.** `src/bridge.rs` invokes the real
+`sedona-functions` DataFusion UDF kernels directly from DuckDB via a
+DuckDB-chunk ⇄ Arrow bridge. 72 `sedona_st_*` functions are registered and
+runtime-verified, including CRS-tagged returns, CRS sidecar extractors,
+WKT/WKB typed constructors, Z/M point constructors, and constant-scalar argument
+detection. 32 public `st_*` functions already route to the literal SedonaDB
+kernel.
 
-1. **Literal Apache SedonaDB bridge — ✅ DONE and now a standing expansion path.**
-   `src/bridge.rs` links the real `sedona-functions` crate (git rev `b23ccd15`,
-   + `sedona-expr`/`schema` and `datafusion-expr`/`-common` as trait types only)
-   and invokes SedonaDB's own DataFusion UDF kernels directly from a DuckDB
-   callback via a DuckDB-chunk ⇄ Arrow bridge (BLOB/WKB → Arrow array →
-   `SedonaScalarUDF::invoke_with_args` → result array → DuckDB vector). 47
-   functions are registered under a `sedona_` prefix, side-by-side with the local
-   reimplementation (`st_dimension` / `sedona_st_dimension` run the same
-   algorithm through two code paths). Struct/item-crs returns are handled by
-   unwrapping the geometry `item` to WKB and, where useful, exposing the CRS
-   sidecar as VARCHAR (`sedona_st_geomfromewkt_crs`). The remaining SedonaDB
-   scalar UDFs are reachable by adding registry lines plus, when needed, one more
-   shared executor shape. Runtime-verified by Rust bridge tests and SQL
-   regressions. The SedonaDB tree is pure-Rust, so it adds no GDAL/PROJ/GEOS and
-   cannot collide with the vendored C deps.
-2. **`ST_Transform` via PROJ (Tier 3a) — ✅ DONE.** `ST_Transform(geom,
-   from_srid, to_srid)` reprojects between EPSG codes with a thread-local `Proj`
-   cache. The transform path uses bundled/static PROJ; the full extension can
-   still need dynamic GDAL/PROJ transitively for raster support.
-3. **Spatial-join via disk-spill (Tier 3b) — ✅ DONE as `sedona_join` table function.**
-   DuckDB's `COPY ... TO 'x.parquet'` is the spill; `sedona_join(a_path, b_path,
-   predicate)` reads both Parquet files itself (`parquet`/`arrow` crates), builds an
-   `rstar` R*-tree over the right side, applies the exact predicate, and streams
-   `(a_row, b_row)` pairs. Verified: 20k×20k building self-join returns 37 pairs —
-   identical to the bbox-prefilter result. This is the SedonaDB disk-spilling spatial
-   join model, realized without needing any DuckDB join-planner/GiST API.
-4. **`ST_VoronoiPolygons`** — `geo` 0.31 has no Voronoi; needs a new dep or port. Still
-   open (low priority).
+Current verification baseline:
+
+- Rust unit tests: 64 pass.
+- SQL regressions: 191 pass / 0 fail.
+- Release smoke test: 7 backend checks pass (local, SedonaDB, aggregate, GEOS, spheroid, raster).
+- Catalog: 227 registered SQL functions (154 `st_*` public + 72 `sedona_st_*` bridge + 1 extension-specific).
 
 ## Capability matrix (category-level)
 
-Legend: ✅ shipped · 🟡 partial · ⏳ not yet · ➖ out of scope (niche).
+Legend: ✅ shipped · 🟡 partial · ⏳ not yet · ➖ intentionally out of scope.
 
-| Category | PostGIS | SedonaDB | sedonadb (this ext.) | Notes |
+| Category | PostGIS | SedonaDB | sedonadb extension | Notes |
 |---|---|---|---|---|
-| Constructors (WKT/WKB/EWKT/EWKB, typed `*FromText`) | ✅ | ✅ | ✅ | WKT/WKB/EWKT/EWKB + typed constructors + `ST_Point` all shipped. `from_wkb` is EWKB-tolerant at the trust boundary. |
-| Output (`ST_AsText/Binary/EWKB/GeoJSON/HexEWKB`) | ✅ | ✅ | ✅ | Text/Binary/EWKB/GeoJSON/HexEWKB all done |
-| Accessors (X/Y/Z/M, dims, rings, N-th geometry/point) | ✅ | ✅ | 🟡 | 2D accessors + `ST_NRings` done; Z/M stubs return NULL/false |
-| DE-9IM predicates (`Intersects`…`Covers`, `OrderingEquals`) | ✅ | ✅ | ✅ | All 10 + `ST_OrderingEquals`; guarded for invalid input |
-| Measurements (`Area/Length/Distance/Perimeter/Azimuth/Hausdorff/MaxDistance/LongestLine/ShortestLine`) | ✅ | ✅ | ✅ | core + distance-family done |
-| Boolean set ops (`Union/Intersection/Difference/SymDiff`) | ✅ | 🟡 | ✅ | |
-| `ST_MakeValid` / validity | ✅ | 🟡 | ✅ | robustness hardening done |
-| Editing (`Translate/Scale/Rotate/Flip/Reverse/Affine/Segmentize/LineSubstring/LineMerge/Normalize`) | ✅ | ✅ | ✅ | all done incl. 6-param `ST_Affine` |
-| Geometry processing (`Buffer/Simplify/ConvexHull/ConcaveHull/OrientedEnvelope/Triangulate/Voronoi`) | ✅ | 🟡 | 🟡 | Buffer/Simplify/Hull/OrientedEnvelope/TriangulatePolygon done; bounded Voronoi polygons + Polygonize open |
-| Linear referencing (`LineInterpolatePoint/Locate/Substring`) | ✅ | 🟡 | ✅ | interpolate/locate/substring all done |
-| Aggregates (`Collect/Union/Envelope/Intersection/MakeLine`) | ✅ | ✅ | ✅ | `ST_Collect`/`ST_Union`/`ST_Envelope`/`ST_MakeLine` agg done; intersection aggregate open |
-| **Geography (geodesic) ops** | ✅ | ✅ | ✅ | `Distance/DWithin/Length/Area` Sphere done (lon/lat) |
-| **CRS / PROJ (`ST_Transform`, SRID)** | ✅ | ✅ | ✅ | `ST_Transform` via PROJ (runtime libproj dep) |
-| **Spatial index join (R-tree/GiST, `&&`/`<->`)** | ✅ | ✅ | ✅ | `sedona_join` table fn (R-tree over spilled parquet) + bbox-prefilter |
-| **Raster / map algebra** | ✅ (PostGIS Raster) | ✅ (`sedona-raster`) | ✅ — `st_raster_info` + `st_raster_stats` + `st_pixeldata` (pixel streaming → DuckDB-native SQL map algebra) via vendored+patched GDAL against libgdal 3.13; full `ST_MapAlgebra` expression engine is unnecessary (SQL IS the algebra) |
-| **3D / Z-M geometry + SFCGAL surfaces** | ✅ (SFCGAL) | ⏳ | ⏳ No mature Rust SFCGAL bindings (see Tier 4) |
-| Topology / Tiger geocoder / address standardizer | ✅ | ➖ | ➖ | niche; not in SedonaDB either |
-
-So: **geometry-level SQL surface** is already broad and at feature parity with
-SedonaDB for the common cases. The real gaps to a true superset are the four
-**infrastructure capabilities** below, not more scalar functions.
-
-## Tiers
-
-### Tier 1 — finish geometry-level parity (small, geo-backed, ~1 line each)
-Cheap wins; each is one `register_*!` line + a `geo` call. **Mostly ✅ done.**
-
-- ✅ EWKB/EWKT I/O: `ST_AsEWKB`, `ST_GeomFromEWKB` (EWKB-tolerant `from_wkb`),
-  `ST_AsEWKT`, `ST_GeomFromEWKT`, `ST_AsHexEWKB`.
-- ✅ SRID stubs: `ST_SRID` (0), `ST_SetSRID` (no-op tag).
-- ✅ Typed constructors: `ST_LineFromText`, `ST_PointFromText`,
-  `ST_PolygonFromText`, `ST_MLineFromText`, … (route through WKT parser).
-- ✅ `ST_Affine`(6 doubles), `ST_Segmentize`, `ST_LineSubstring`,
-  `ST_LineMerge`, `ST_CollectionExtract`, `ST_ForceCollection`, `ST_Multi`,
-  `ST_Normalize`, `ST_ForceRHR`/`ST_ForcePolygonCW`/`ST_ForcePolygonCCW`,
-  `ST_SnapToGrid`.
-- ✅ More aggregates: `ST_Union` agg (`st_union_agg`), `ST_Envelope` agg.
-  `ST_Collect` already done. Intersection aggregate still open.
-- ✅ `ST_TriangulatePolygon` (Delaunay-interior approximation).
-- ✅ `ST_Dump`, `ST_DumpPoints`, `ST_DumpSegments` — set-returning table
-  functions (`src/dump.rs`); the previously- unbuilt FFI shape is now wired up.
-- ✅ `ST_MakeEnvelope`, `ST_MakePolygon`, `ST_RemovePoint`/`ST_AddPoint`,
-  `ST_SimplifyPreserveTopology`, `ST_MinimumClearance`/`...Line`,
-  `ST_MinimumBoundingCircle` (Welzl), `ST_GeneratePoints`, `ST_IsValidReason`.
-- ⏳ `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea` — topology editing.
-- ⏳ `ST_VoronoiPolygons` (bounded cell polygons; `ST_VoronoiLines` already
-  ships).
-
-### Tier 1b — PostGIS geo-backed geometry processing
-✅ `ST_HausdorffDistance`, `ST_FrechetDistance`, `ST_MaxDistance`,
-`ST_LongestLine`, `ST_ClosestPoint`, `ST_ShortestLine`, `ST_Project`,
-`ST_OrientedEnvelope`, `ST_TriangulatePolygon`, `ST_MinimumClearance`/`...Line`,
-`ST_MinimumBoundingCircle`, `ST_GeneratePoints` all shipped. Still open:
-`ST_Subdivide`.
-
-### Tier 2 — Geography (geodesic) — ✅ DONE
-`ST_DistanceSphere`, `ST_DWithinSphere`, `ST_LengthSphere`, `ST_AreaSphere`
-(launch/lat → metres / m² via `geo`'s Haversine + Chamberlain-Duquette). No new
-dep. (PostGIS spheroid-accurate `ST_DistanceSpheroid` and full
-geometry-vs-geometry geodesic distance still open.)
-
-### Tier 3 — CRS reprojection + native spatial index — ✅ DONE
-- **`ST_Transform` via PROJ** — implemented (`proj` crate). Runtime dep on
-  `libproj.so`. Thread-local CRS cache. Verified on 4326↔3857.
-- **Spatial index join** — two paths: (1) `sedona_join(a.parquet, b.parquet,
-  predicate)` table function: extension reads both files, builds an `rstar`
-  R*-tree, streams matching pairs — the disk-spill model; (2) bbox-prefilter via
-  materialized `ST_XMin/Max/YMin/MaxY` + DuckDB IEJoin for inline joins. Both
-  verified against SpatialBench (20k building self-join = 37 pairs either way).
-
-### Tier 4 — Raster, 3D, topology (long tail)
-- **Raster / map algebra** — ✅ Core landed via **vendored + patched GDAL** against
-  libgdal 3.13. The upstream `gdal` 0.19 crate lags 3.13 (it renamed `GDT_Byte`→
-  `GDT_UInt8` and added `GDALRasterIOExtraArg::bOperateInBufType`); we vendor only
-  the high-level `gdal` crate (`vendor/gdal`, with `PATCHES.md`) — `gdal-sys` is
-  unpatched and pulled from crates.io — and enable `bindgen` so fresh FFI
-  bindings are generated from the installed 3.13 headers. Ships
-  `st_raster_info(path)` and `st_raster_stats(path, band)` (read any GDAL format;
-  summary stats in the band's native type). **Open:** `ST_MapAlgebra`, `ST_AsRaster`,
-  `ST_Clip`, band math. **Build needs** `pkg-config gdal` + `LIBCLANG_PATH`;
-  **runtime needs** `libgdal.so` (+ its libproj/libsqlite3) via `LD_LIBRARY_PATH`.
-- **Static PROJ** — ✅ Our own PROJ (for `ST_Transform`) is now **bundled +
-  statically linked** (`proj-sys/bundled_proj` + `libsqlite3-sys/bundled`), so
-  reprojection has no runtime dep of its own. GDAL brings its own dynamic libproj,
-  so the extension overall still needs `LD_LIBRARY_PATH` (or system libgdal) while
-  GDAL is linked. (GDAL is intentionally **not** feature-gated — the extension is
-  a single full-capability build.)
-- **Delaunay / Voronoi** — ✅ Done. `ST_DelaunayTriangles` (via `delaunator`)
-  and `ST_VoronoiLines` (dual of the Delaunay triangulation — interior edges;
-  full bounded cell polygons still open).
-- **3D / Z-M + SFCGAL** — ⏳ Not feasible today. `geo`/`wkb`/our pipeline are
-  2D-only; full 3D needs Z/M through the entire stack plus surface algorithms
-  (extrude, straight skeleton, 3D boolean). **There is no mature Rust SFCGAL/CGAL
-  binding** — this would mean writing/maintaining `sfcgal-sys` (weeks+). The one
-  genuinely out-of-reach PostGIS surface for a Rust extension.
-- **Topology** — ➖ niche; PostGIS topology is a separate subsystem and not in
-  SedonaDB. Out of scope.
+| Constructors (WKT/WKB/EWKT/EWKB, typed `*FromText`) | ✅ | ✅ | ✅ | WKT/WKB/EWKT/EWKB + typed constructors + point/Z/M constructors. |
+| Output (`ST_AsText/Binary/EWKB/GeoJSON/HexEWKB`) | ✅ | ✅ | ✅ | Text/Binary/EWKB/GeoJSON/HexEWKB shipped. |
+| Accessors (X/Y/Z/M, dims, rings, N-th geometry/point) | ✅ | ✅ | 🟡 | Broad 2D + bridged Z/M accessors; full Z/M-preserving local pipeline remains limited. |
+| DE-9IM predicates (`Intersects`…`Covers`, `OrderingEquals`) | ✅ | ✅ | ✅ | Guarded for invalid input. |
+| Measurements (`Area/Length/Distance/Perimeter/Azimuth/Hausdorff/...`) | ✅ | ✅ | ✅ | Core, distance-family, clearance-family shipped. |
+| Boolean set ops (`Union/Intersection/Difference/SymDiff`) | ✅ | 🟡 | ✅ | Scalar polygonal set ops shipped; intersection aggregate still open. |
+| `ST_MakeValid` / validity | ✅ | 🟡 | ✅ | Robustness hardening shipped. |
+| Editing (`Translate/Scale/Rotate/Flip/Reverse/Affine/Segmentize/...`) | ✅ | ✅ | ✅ | Includes 6-param `ST_Affine`; `ST_Snap` via GEOS. |
+| Geometry processing (`Buffer/Simplify/Hulls/Triangulate/Voronoi`) | ✅ | 🟡 | ✅ | Bounded Voronoi polygons via GEOS. |
+| Topology editing (`Node/Polygonize/BuildArea`) | ✅ | 🟡 | ✅ | GEOS-backed. |
+| Linear referencing (`LineInterpolatePoint/Locate/Substring`) | ✅ | 🟡 | ✅ | Done. |
+| Aggregates (`Collect/Union/Envelope/Intersection/MakeLine`) | ✅ | ✅ | 🟡 | Collect/Union/Envelope/MakeLine done; intersection aggregate open. |
+| Geography/geodesic ops | ✅ | ✅ | ✅ | Sphere + WGS84 spheroid (`Distance/DWithin/Length/Area`) done; custom spheroid parameter open. |
+| CRS / PROJ (`ST_Transform`, SRID) | ✅ | ✅ | ✅ | `ST_Transform` via PROJ; SRID represented at extension-native fidelity with CRS sidecars where needed. |
+| Spatial index join (`&&`, GiST/R-tree workflows) | ✅ | ✅ | ✅ | `sedona_join` table fn over spilled parquet + bbox prefilter helpers. |
+| Raster / map algebra | ✅ | ✅ | 🟡 | Info/stats/transform/pixel streaming done; clipping/rasterization/value APIs open. |
+| 3D / Z-M geometry + SFCGAL surfaces | ✅ | ⏳ | ⏳ | Z/M bridge surface exists; full 3D solid/surface operations are out of scope until mature Rust SFCGAL/CGAL exists. |
+| Topology schema / Tiger geocoder / address standardizer | ✅ | ➖ | ➖ | PostgreSQL-specific/niche subsystems; intentionally out of scope. |
 
 ## What "superset" realistically means
 
-A 100% byte-compatible PostGIS clone is not the target: PostgreSQL operators,
-GiST planner integration, SFCGAL 3D solids, topology, Tiger/geocoder, and some
-raster administration APIs do not map cleanly to a DuckDB loadable extension.
+A 100% byte-compatible PostGIS clone is not the target. PostgreSQL operators,
+GiST planner integration, SFCGAL 3D solids, topology schemas, Tiger/geocoder, and
+some raster administration APIs do not map cleanly to a DuckDB loadable
+extension.
 
-The target is higher value and more focused:
+The target is higher-value and more focused:
 
 1. **SedonaDB-plus:** every practical SedonaDB vector SQL function available in
    DuckDB, with the literal bridge as the canonical implementation for matching
@@ -239,82 +146,163 @@ The target is higher value and more focused:
 2. **PostGIS-compatible core:** the common PostGIS vector/geography/CRS/raster
    analysis surface under familiar `ST_*` names, with exact semantics where
    feasible and tested/documented deltas where not.
-3. **DuckDB-native usability:** install/load/package cleanly, operate on WKB BLOBs
+3. **DuckDB-native workflows:** install/load/package cleanly, operate on WKB BLOBs
    that interoperate with DuckDB `spatial`, stream through vectorized chunks, and
-   provide spatial-join/raster workflows that fit DuckDB rather than PostgreSQL.
+   provide join/raster workflows that fit DuckDB rather than PostgreSQL internals.
 4. **Maintainable growth:** new functions should expand a small number of shared
    executor families and reference tests, not create per-function FFI or semantic
    snowflakes.
 
-## Focused execution plan
+## Three-month development plan (July–September 2026)
 
-### P0 — compatibility contract and safety net (always-on) — ✅ LANDED
+The next three months are about **quality, fidelity, usability, and
+maintainability**, not raw catalog count. Every item below should either make the
+extension more PostGIS/SedonaDB-compatible for real SQL, move work to a canonical
+backend, or reduce future maintenance risk.
 
-- `tests/fidelity.sql` is the gate for every overlapping `st_*` / `sedona_st_*`
-  function; `tests/edge_cases.sql` covers empty/NULL/Z-dim/extreme/cocircular
-  degenerate inputs through both paths.
-- A PostGIS/SedonaDB fixture corpus for the remaining hard edge cases
-  (antimeridian, spheroid) grows incrementally as those capabilities land.
-- Each routed function is proven equivalent before the local code is unwired.
-- `try_udf`/bridge lookup stays fail-closed under `panic = "abort"`.
+Planning rules:
 
-### P1 — make the literal SedonaDB bridge the default implementation path — ✅ LANDED
+- Ship in small vertical slices: registry entry, backend/executor shape if needed,
+  reference tests, docs, benchmark/smoke coverage when relevant.
+- Prefer replacing local duplicate semantics with literal SedonaDB or GEOS/GDAL
+  canonical behavior over adding new local algorithms.
+- Treat docs as a product surface: no undocumented semantic deltas and no stale
+  capability counts.
+- Defer large/niche systems that would blur the product: PostgreSQL planner hooks,
+  topology schema, Tiger/geocoder, SFCGAL solids, and a custom raster expression
+  language.
 
-- Full inventory of `default_function_set()` done; every registrable scalar UDF
-  is bridged (65 `sedona_st_*` functions). Only ST_Affine (geom+6 doubles),
-  type-conversion UDFs (st_togeography/st_togeometry), and special/table UDFs
-  (st_knn/st_dump/sd_*) remain — each blocked on a new shape or unsupported type.
-- 20 public `st_*` accessors now route to the literal SedonaDB kernel (one
-  implementation, two SQL entry points); overlapping local code is dormant.
-- CRS/item-crs returns stay unwrapped to native WKB with opt-in `*_crs` helpers.
+### Month 1 — compatibility contract and namespace polish
 
-### P2 — PostGIS namespace and usability polish — ✅ LANDED
+Outcome: users can see exactly what is compatible, what is bridged, and what
+differs before they port SQL.
 
-- README "PostGIS compatibility & common workflows" subsection with runnable
-  examples (CRS reprojection, geodesic distance, bbox-prefilter join, literal
-  comparison) and documented deltas (2D stack, no PG operators/GiST, SRID
-  sidecar).
-- Alias/arity alignment is ongoing as new functions land.
+1. **Generated catalog audit.** Add a small maintainer tool that reads
+   `src/registry.rs` and emits the registered SQL catalog grouped by provenance:
+   literal SedonaDB, local geo, GEOS, PROJ, GDAL/raster, aggregates, and table
+   functions. Use it to refresh README/ROADMAP counts.
+2. **PostGIS/SedonaDB compatibility table.** Publish a compact table for common
+   functions: supported, alias-only, semantic delta, DuckDB-native alternative,
+   or intentionally out of scope.
+3. **Namespace cleanup.** Add only low-risk PostGIS aliases/overloads that are
+   unambiguous in DuckDB and covered by SQL tests. Keep `st_*` the ergonomic
+   namespace and `sedona_st_*` the explicit literal provenance namespace.
+4. **Literal routing pass.** Re-inventory SedonaDB's
+   `default_function_set()` at the pinned rev and route additional public `st_*`
+   functions to the literal kernel where signatures and edge-case behavior match.
+5. **Reference fixtures expansion.** Add fixtures for empty/invalid geometry,
+   collections, antimeridian/antipodal geography, CRS round-trips, Voronoi/snap
+   degeneracies, nodata rasters, and Z/M constructor/accessor behavior.
 
-### P3 — hard capability gaps, only with correct algorithms — ✅ LANDED
+Exit gates:
 
-- **Topology editing:** `ST_Node` (GEOS), `ST_Polygonize` (GEOS),
-  `ST_BuildArea` (GEOS) — PostGIS-grade planar topology via a narrow
-  `src/geos_backend.rs` boundary (WKB → GEOS → WKB, no geo_types round-trip).
-- **Bounded Voronoi polygons:** `ST_VoronoiPolygons` (GEOS). The 3×3 cocircular
-  grid that defeated the earlier angle-sort prototype now yields exactly 9 cells.
-- **Spheroid geodesics:** `ST_DistanceSpheroid`, `ST_LengthSpheroid`,
-  `ST_AreaSpheroid`, `ST_DWithinSpheroid` via GeographicLib (Karney's algorithm)
-  on the WGS84 ellipsoid — converges everywhere including antipodal points.
-- **Raster map algebra:** `ST_PixelData(path, band)` streams band pixels as
-  (row, col, value) rows; map algebra is then DuckDB-native SQL (WHERE/CASE/
-  arithmetic). No custom expression parser — the narrow GDAL boundary stays at
-  one band read → DuckDB rows.
-- Still open: `ST_Snap` (needs GEOS snap, lower priority), `ST_AsRaster`
-  (rasterize a geometry), custom-spheroid parameter for `*Spheroid` functions.
+- Catalog counts are generated or reproducibly audited from `registry.rs`.
+- README and ROADMAP agree on function counts, backend ownership, and deltas.
+- Every new alias/routed function has a regression and, when applicable, a
+  `st_*` vs `sedona_st_*` fidelity check.
 
-- **Topology editing:** `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea`.
-  These need robust graph/topology code and should land with adversarial fixtures,
-  not heuristic approximations.
-- **Bounded Voronoi polygons:** implement only with a correct half-edge/infinite
-  edge treatment and tests for cocircular grids, duplicate points, hull cells, and
-  tolerance. The earlier angle-sort prototype was rejected because it lost cells
-  on degenerate inputs.
-- **Spheroid geodesics:** add `ST_DistanceSpheroid`/related functions with a
-  Karney/Vincenty-quality implementation and reference fixtures; keep current
-  `*Sphere` functions explicit about spherical units/accuracy.
-- **Raster map algebra:** extend from `st_raster_info`/`st_raster_stats` to
-  clipping, rasterization, and band math behind a narrow GDAL boundary, with
-  deterministic small rasters in tests.
+### Month 2 — high-fidelity capability work
 
-### P4 — maintainability and release engineering
+Outcome: fill high-value gaps with canonical engines, especially where incorrect
+approximations would be harmful.
 
-- Keep dependency boundaries explicit: pure-Rust Sedona bridge, bundled/static
-  PROJ for transforms, dynamic GDAL for raster, and no accidental GEOS/SFCGAL
-  runtime requirement unless deliberately added.
-- Track binary size, load-time smoke, bridge overhead, and representative query
-  performance in `benchmarks/`.
-- Prefer small commits by phase: executor shape + registrations + SQL/Rust tests
-  + docs; avoid large mixed semantic changes.
-- Periodically regenerate the capability matrix from the registry to prevent docs
-  from drifting away from the SQL catalog.
+1. **GEOS-backed large-geometry tools.** Implement `ST_Subdivide` if a robust,
+   deterministic GEOS or well-tested local strategy is available. Prioritize join
+   and raster workflows over exotic options.
+2. **Aggregate hardening.** Revisit `ST_IntersectionAgg`; ship only if invalid,
+   empty, and mixed-type cases can be tested and fail closed. Otherwise document
+   the explicit SQL workaround.
+3. **Raster value access.** Add `ST_Value`/point sampling and nodata-aware band
+   metadata helpers. Keep map algebra as DuckDB SQL over `st_pixeldata` rather
+   than a separate expression parser.
+4. **Raster clipping workflow.** Prefer a DuckDB-native clip recipe using
+   `st_pixeldata`, `st_raster_transform`, and geometry predicates. Add a GDAL
+   `ST_Clip` only if the API remains small and semantics can be tested against
+   references.
+5. **Spheroid parameter fidelity.** Evaluate PostGIS-compatible custom spheroid
+   parsing for `*Spheroid`; ship only if the default WGS84 behavior stays simple
+   and unambiguous.
+
+Exit gates:
+
+- New hard algorithms use canonical backend behavior or are explicitly deferred.
+- Raster nodata, bounds, and coordinate transforms have regression coverage.
+- Benchmarks include any new GEOS/raster paths that can affect analytical scale.
+
+### Month 3 — usability, scale, and release readiness
+
+Outcome: the full-capability extension is easy to install, debug, and use for
+real DuckDB spatial analytics.
+
+1. **Spatial join ergonomics.** Add documented recipes for bbox columns,
+   IEJoin-friendly predicates, and `sedona_join` spill/R-tree workflows. Consider
+   helper SQL/macros only if they reduce user error without hiding semantics.
+2. **Performance budgets.** Turn `benchmarks/backends.sql` into a repeatable
+   tracking suite for bridge overhead, GEOS calls, spheroid geodesics, raster scan
+   throughput, package size, and load time.
+3. **Release packaging.** Keep one full-capability extension as the default.
+   Harden container build/test scripts and smoke tests for DuckDB, SedonaDB,
+   local geo, GEOS, PROJ, GDAL, raster, aggregates, and table functions.
+4. **User-facing examples.** Add copy-pasteable workflows for GeoParquet ingest,
+   CRS transform joins, geodesic distance, dissolve, dump, raster sampling,
+   raster reclassification, and `sedona_join`.
+5. **Maintenance cleanup.** Delete or clearly mark dormant local implementations
+   once public `st_*` routes to SedonaDB/GEOS. Keep backend boundaries small and
+   documented.
+
+Exit gates:
+
+- Release smoke covers every backend family and at least one table function.
+- README has a short path from install → load → common workflows → known deltas.
+- Benchmarks and SQL regressions can be run by a new contributor using documented
+  commands.
+
+## Standing release gates
+
+These are non-negotiable for every month and every release:
+
+- No silent wrong geometry.
+- `st_*` remains the ergonomic PostGIS/SedonaDB-like namespace.
+- Literal SedonaDB kernels remain callable and tested under `sedona_st_*`.
+- All backends fail closed on invalid/unsupported input.
+- SQL regressions, Rust tests, release packaging, and smoke tests pass.
+- New semantic deltas are documented before they ship.
+
+## Priority backlog
+
+### Now / next three months
+
+- Generated catalog and compatibility table from `registry.rs`.
+- More public `st_*` routing to literal SedonaDB where proven equivalent.
+- GEOS-backed `ST_Subdivide` or an explicit defer with rationale.
+- `ST_IntersectionAgg` decision: robust implementation or documented workaround.
+- Raster value/nodata helpers and a tested clipping workflow.
+- Spatial-join usability docs and benchmark tracking.
+
+### Later, if justified by users and tests
+
+- Additional PostGIS aliases/overloads once ambiguity and fidelity are resolved.
+- More GDAL-backed raster administration helpers.
+- macOS/Linux release automation beyond the current container flow.
+- Custom spheroid parsing if it can match PostGIS without confusing defaults.
+
+### Not currently a goal
+
+- PostgreSQL planner/operator compatibility (`&&`, `<->`, GiST hooks) beyond
+  documented functional equivalents.
+- PostGIS topology schema, Tiger geocoder, address standardizer.
+- Full SFCGAL/CGAL 3D solids/surfaces before mature Rust bindings exist.
+- A custom raster map-algebra expression language; DuckDB SQL is the expression
+  language.
+
+## Definition of done for a new capability
+
+1. Namespace matches PostGIS/SedonaDB where feasible, or a DuckDB-specific name is
+   justified.
+2. Canonical backend chosen and documented.
+3. Invalid/unsupported inputs return NULL or a documented error state; no panic.
+4. SQL regression covers normal behavior and at least one edge case.
+5. If overlapping SedonaDB exists, fidelity comparison is added or divergence is
+   documented.
+6. README/ROADMAP mention any semantic delta or runtime dependency.
+7. `cargo test --lib`, release build, SQL suites, and package smoke pass.

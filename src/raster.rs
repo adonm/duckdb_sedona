@@ -257,3 +257,88 @@ pub unsafe extern "C" fn pixeldata_scan(info: duckdb_function_info, output: duck
     unsafe { chunk.set_size(batch) };
     drop((c0, c1, c2));
 }
+
+// ===== st_raster_transform(path) ========================================
+// Returns the GeoTransform (6 params) + computed spatial bounds in one row.
+// This lets users convert between pixel (row,col) and geographic (x,y)
+// coordinates entirely in SQL:
+//   x = origin_x + col * pixel_w + row * row_rot
+//   y = origin_y + col * col_rot + row * pixel_h
+
+pub struct RasterTransformBind {
+    origin_x: f64, origin_y: f64,
+    pixel_w: f64, pixel_h: f64,
+    row_rot: f64, col_rot: f64,
+    xmin: f64, ymin: f64, xmax: f64, ymax: f64,
+}
+
+pub unsafe extern "C" fn raster_transform_bind(info: duckdb_bind_info) {
+    let bi = unsafe { BindInfo::new(info) };
+    let path = unsafe { bi.get_parameter_value(0) }.as_str().unwrap_or_default();
+    let ds = match Dataset::open(&path) {
+        Ok(ds) => ds,
+        Err(e) => { bi.set_error(&format!("open {path}: {e}")); return; }
+    };
+    let gt = ds.geo_transform().unwrap_or_else(|_| [0.0, 1.0, 0.0, 0.0, 0.0, -1.0]);
+    let (w, h) = ds.raster_size();
+    // Compute the four corner coordinates to derive bounds.
+    let corners = [
+        (gt[0], gt[3]),                                              // top-left
+        (gt[0] + w as f64 * gt[1], gt[3] + w as f64 * gt[4]),        // top-right
+        (gt[0] + h as f64 * gt[2], gt[3] + h as f64 * gt[5]),        // bottom-left
+        (gt[0] + w as f64 * gt[1] + h as f64 * gt[2],                // bottom-right
+         gt[3] + w as f64 * gt[4] + h as f64 * gt[5]),
+    ];
+    let (xmin, xmax) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &(x, _)| (mn.min(x), mx.max(x)));
+    let (ymin, ymax) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &(_, y)| (mn.min(y), mx.max(y)));
+    bi.add_result_column("origin_x", TypeId::Double)
+        .add_result_column("origin_y", TypeId::Double)
+        .add_result_column("pixel_w", TypeId::Double)
+        .add_result_column("pixel_h", TypeId::Double)
+        .add_result_column("row_rot", TypeId::Double)
+        .add_result_column("col_rot", TypeId::Double)
+        .add_result_column("xmin", TypeId::Double)
+        .add_result_column("ymin", TypeId::Double)
+        .add_result_column("xmax", TypeId::Double)
+        .add_result_column("ymax", TypeId::Double)
+        .set_cardinality(1, true);
+    unsafe {
+        FfiBindData::<RasterTransformBind>::set(info, RasterTransformBind {
+            origin_x: gt[0], origin_y: gt[3],
+            pixel_w: gt[1], pixel_h: gt[5],
+            row_rot: gt[2], col_rot: gt[4],
+            xmin, ymin, xmax, ymax,
+        })
+    };
+}
+
+pub unsafe extern "C" fn raster_transform_init(info: duckdb_init_info) {
+    unsafe { InitInfo::new(info).set_max_threads(1) };
+    unsafe { FfiInitData::<bool>::set(info, false) };
+}
+
+pub unsafe extern "C" fn raster_transform_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    let chunk = unsafe { DataChunk::from_raw(output) };
+    let Some(emitted) = (unsafe { FfiInitData::<bool>::get_mut(info) }) else { unsafe { chunk.set_size(0) }; return; };
+    if *emitted { unsafe { chunk.set_size(0) }; return; }
+    *emitted = true;
+    let Some(data) = (unsafe { FfiBindData::<RasterTransformBind>::get_from_function(info) }) else { unsafe { chunk.set_size(0) }; return; };
+    let mut cols: [quack_rs::vector::VectorWriter; 10] = [
+        unsafe { chunk.writer(0) }, unsafe { chunk.writer(1) }, unsafe { chunk.writer(2) },
+        unsafe { chunk.writer(3) }, unsafe { chunk.writer(4) }, unsafe { chunk.writer(5) },
+        unsafe { chunk.writer(6) }, unsafe { chunk.writer(7) }, unsafe { chunk.writer(8) },
+        unsafe { chunk.writer(9) },
+    ];
+    unsafe { cols[0].write_f64(0, data.origin_x) };
+    unsafe { cols[1].write_f64(0, data.origin_y) };
+    unsafe { cols[2].write_f64(0, data.pixel_w) };
+    unsafe { cols[3].write_f64(0, data.pixel_h) };
+    unsafe { cols[4].write_f64(0, data.row_rot) };
+    unsafe { cols[5].write_f64(0, data.col_rot) };
+    unsafe { cols[6].write_f64(0, data.xmin) };
+    unsafe { cols[7].write_f64(0, data.ymin) };
+    unsafe { cols[8].write_f64(0, data.xmax) };
+    unsafe { cols[9].write_f64(0, data.ymax) };
+    unsafe { chunk.set_size(1) };
+    drop(cols);
+}

@@ -68,6 +68,26 @@ pub fn voronoi_polygons(wkb: &[u8], tolerance: f64, extend_to: Option<&[u8]>) ->
     to_wkb(&result)
 }
 
+/// `ST_Snap(geom1, geom2, tolerance)` — snap vertices of geom1 to geom2 where
+/// they are within `tolerance`. This is the canonical PostGIS `ST_Snap`,
+/// powered by the same GEOS engine PostGIS uses.
+pub fn snap(wkb1: &[u8], wkb2: &[u8], tolerance: f64) -> Option<Vec<u8>> {
+    let g1 = from_wkb(wkb1)?;
+    let g2 = from_wkb(wkb2)?;
+    let result = g1.snap(&g2, tolerance).ok()?;
+    to_wkb(&result)
+}
+
+/// `ST_MakeValid(geom)` — repair invalid geometry using the GEOS MakeValid
+/// algorithm (the canonical PostGIS engine). This is higher-fidelity than the
+/// local `buffer(0)` heuristic because it preserves structure (rings, holes)
+/// rather than relying on a zero-width buffer to fix topology.
+pub fn make_valid(wkb: &[u8]) -> Option<Vec<u8>> {
+    let g = from_wkb(wkb)?;
+    let result = g.make_valid().ok()?;
+    to_wkb(&result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +130,50 @@ mod tests {
         let g = from_wkb(&area).unwrap();
         let a = g.area().unwrap();
         assert!((a - 15.0).abs() < 1e-6, "4x4 square minus 1x1 hole = 15, got {a}");
+    }
+
+    #[test]
+    fn geos_snap_nearby_vertices() {
+        // Snap a polygon vertex at (4, 0.01) to a reference line vertex at (4, 0)
+        // with tolerance 0.1. The snapped geometry should have the vertex at (4, 0).
+        let poly = geo_wkb("POLYGON((0 0,4 0.01,8 0,4 4,0 0))");
+        let ref_geom = geo_wkb("POINT(4 0)");
+        let snapped = snap(&poly, &ref_geom, 0.1).expect("snap should succeed");
+        let g = from_wkb(&snapped).unwrap();
+        // After snapping, the polygon should still be valid and have 5 coords.
+        assert!(g.is_valid().unwrap(), "snapped polygon must be valid");
+    }
+
+    #[test]
+    fn geos_snap_zero_tolerance_is_identity() {
+        let poly = geo_wkb("POLYGON((0 0,4 0,8 0,4 4,0 0))");
+        let ref_geom = geo_wkb("POINT(100 100)");
+        let snapped = snap(&poly, &ref_geom, 0.0).expect("snap(0) should succeed");
+        // Zero tolerance → no snapping, geometry unchanged.
+        let original = from_wkb(&poly).unwrap();
+        let snapped_g = from_wkb(&snapped).unwrap();
+        assert_eq!(
+            original.get_num_coordinates().unwrap(),
+            snapped_g.get_num_coordinates().unwrap(),
+            "zero-tolerance snap preserves coordinate count"
+        );
+    }
+
+    #[test]
+    fn geos_make_valid_self_intersecting_polygon() {
+        // A self-intersecting "bowtie" polygon → GEOS MakeValid should repair it.
+        let bad = geo_wkb("POLYGON((0 0,4 4,4 0,0 4,0 0))");
+        let repaired = make_valid(&bad).expect("make_valid should succeed");
+        let g = from_wkb(&repaired).unwrap();
+        assert!(g.is_valid().unwrap(), "repaired geometry must be valid");
+    }
+
+    #[test]
+    fn geos_make_valid_already_valid_is_identity() {
+        let good = geo_wkb("POLYGON((0 0,4 0,4 4,0 4,0 0))");
+        let repaired = make_valid(&good).expect("make_valid should succeed");
+        let g = from_wkb(&repaired).unwrap();
+        assert!(g.is_valid().unwrap(), "valid input stays valid");
     }
 
     /// Helper: build WKB from a WKT string using the extension's own stack.

@@ -200,6 +200,31 @@ where
     }
 }
 
+/// Vectorized executor for binary raw-WKB + double functions
+/// (`Fn(&[u8], &[u8], f64) -> Option<Vec<u8>>`).
+/// Used by the GEOS backend for `ST_Snap(geom, geom, tolerance)`.
+pub fn binary_wkb_double<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
+where
+    F: Fn(&[u8], &[u8], f64) -> Option<Vec<u8>>,
+{
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let left = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let right = unsafe { VectorReader::new(chunk.as_raw(), 1) };
+    let dbl = unsafe { VectorReader::new(chunk.as_raw(), 2) };
+    let mut writer = unsafe { VectorWriter::new(output) };
+    for row in 0..left.row_count() {
+        let (Some(a), Some(b), Some(tol)) = (read_blob(&left, row), read_blob(&right, row), read_f64(&dbl, row))
+        else {
+            unsafe { writer.set_null(row) };
+            continue;
+        };
+        match f(a, b, tol) {
+            Some(out) => unsafe { writer.write_blob(row, &out) },
+            None => unsafe { writer.set_null(row) },
+        }
+    }
+}
+
 /// Vectorized executor for binary geometry-producing functions
 /// (`ST_Intersection`, `ST_Union`, ...).
 pub fn binary_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)

@@ -4,6 +4,22 @@ Runs the [Apache SpatialBench](https://github.com/apache/sedona-spatialbench)
 queries against the **sedonadb** extension over a **local DuckLake** (DuckDB file
 as catalog, local folder for Parquet data).
 
+## Benchmark suites
+
+| Script | What it measures |
+|--------|-----------------|
+| `run.sh` / `run_queries.sh` | SpatialBench end-to-end (Q1–Q7, FN_dist/FN_area) over 600k trips / 20k buildings |
+| `bridge.sql` | Literal SedonaDB bridge overhead vs local reimplementation (1M points) |
+| `backends.sql` | GEOS topology, spheroid geodesics, raster streaming, bridge overhead (10k–100k rows) |
+
+Run `backends.sql`:
+
+```sh
+LD_LIBRARY_PATH="$(brew --prefix gdal)/lib" \
+  duckdb -unsigned -cmd "LOAD 'build/dev/sedonadb.duckdb_extension';" \
+  < benchmarks/backends.sql
+```
+
 ## Reproduce
 
 ```sh
@@ -69,13 +85,14 @@ polygons. `geo` 0.31's `relate` and point-in-polygon paths crash on these.
 Three layered fixes were added so the extension degrades gracefully instead of
 segfaulting:
 
-1. **`ST_MakeValid(geom)` + an internal `ensure_valid` guard.** Every
+1. **Public GEOS `ST_MakeValid(geom)` + an internal `ensure_valid` guard.** Every
    relate-based predicate (`ST_Within/Contains/Covers/CoveredBy/Equals/Touches/
    Crosses/Overlaps`) and every boolean op (`ST_Intersection/Union/Difference/
-   SymDifference`) now validates its inputs and, if invalid, repairs them with
-   `buffer(0)` (even-odd topology rebuild) before calling into `geo`. Valid
-   inputs take the cheap fast path (`is_valid` + borrow, no copy). This fixes
-   the broad class of *invalid-polygon* errors across the whole catalog.
+   SymDifference`) validates inputs and avoids fabricating results for invalid
+   geometry. The public `ST_MakeValid` route now uses GEOS `make_valid` (the same
+   canonical engine PostGIS uses); the local guard remains a cheap repair/fallback
+   around `geo` operations. Valid inputs take the cheap fast path (`is_valid` +
+   borrow, no copy).
 2. **Custom ray-cast point-in-polygon for `ST_Within`/`ST_Contains`.** When one
    operand is a point (the SpatialBench join shape), we run PNPOLY even-odd ray
    casting ourselves instead of `geo`'s `Contains<Point>`. It is iterative O(n),
@@ -88,18 +105,9 @@ segfaulting:
 
 ## Known limitations
 
-- **`ORDER BY ... LIMIT` on a geometry column that then feeds a scalar function
-  segfaults.** An ordered/limited subquery yields a non-flat
-  (sequence/dictionary) vector. The DuckDB **C API exposes no vector-encoding
-  inspection** (only `duckdb_vector_get_data` / `get_validity` /
-  `get_column_type`), so `BlobCol` cannot portably decode it and reads garbage
-  → SIGSEGV. (This equally affects `quack-rs`'s own `VectorReader`.) Q4's
-  canonical `ORDER BY t_tip DESC LIMIT 1000` form hits this; the benchmark uses
-  the filter-equivalent (`WHERE t_tip > 40 LIMIT 1000`), which materializes a
-  flat vector. **Workaround for users:** materialize the ordered geometry set
-  into a temp/CTE table first, or filter instead of order. **Real fix:** the
-  DuckDB C API would need to expose vector types (or a "flatten/fetch row"
-  helper); tracked as the main portability gap.
+- **Non-flat vector encodings are fixed and pinned by tests.** Ordered/limited,
+  filtered, projected, and constant geometry vectors now feed scalar `ST_*` and
+  `sedona_*` callbacks without segfaulting (`tests/vector_encodings.sql`).
 - **General (non-point) `ST_Within/Contains/Covers/...` on a 100k+ vertex
   polygon** can still overflow `geo`'s geomgraph `relate`. The point case is
   covered by fix #2 above; the general case is the upstream `geo` bug below.
@@ -165,4 +173,3 @@ allocation-tuning is warranted: the per-chunk Arrow array build is amortized
 across DuckDB's standard 2048-row chunks, and SedonaDB's own WKB iteration is
 already vectorized. Reproduce with:
 `LD_LIBRARY_PATH=<gdal-lib> duckdb -unsigned -cmd "LOAD '<ext>';" < benchmarks/bridge.sql`.
-

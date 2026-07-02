@@ -1556,6 +1556,20 @@ pub fn force_collection(g: &Geom) -> Option<Geom> {
     }
 }
 
+/// `ST_Collect(geom1, geom2)` — scalar binary collect. Returns a
+/// GeometryCollection containing both inputs. If either input is itself a
+/// GeometryCollection, its children are flattened in (matching PostGIS).
+pub fn collect_two(g1: &Geom, g2: &Geom) -> Option<Geom> {
+    let mut items = Vec::new();
+    for g in [g1, g2] {
+        match g {
+            Geometry::GeometryCollection(c) => items.extend(c.0.iter().cloned()),
+            other => items.push(other.clone()),
+        }
+    }
+    Some(Geometry::GeometryCollection(geo_types::GeometryCollection(items)))
+}
+
 /// `ST_Multi(geom)` — promote a single geometry to its Multi form. Multi and
 /// collection inputs pass through unchanged.
 pub fn multi(g: &Geom) -> Option<Geom> {

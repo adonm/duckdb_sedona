@@ -91,16 +91,21 @@ dispatch + declarative macro registry, low-maintenance single-line registration
 
 All functions take **BLOB** (ISO WKB) arguments. Geometry-returning functions
 return **BLOB** (ISO WKB). `NULL` in → `NULL` out; an input that fails to parse
-or an operation that is undefined for the input also yields `NULL`. **~130
-functions** across constructors, accessors, predicates, measurements, set ops,
-transforms, validity, four aggregates (`st_collect`, `st_envelope_agg`,
-`st_union_agg`, `st_makeline_agg`), **geodesic/geography**
-(`st_distancesphere`…), EWKT/EWKB/SRID, affine & segmentize transforms, line
-editing, a set-returning `ST_Dump` family (`st_dump`/`st_dumppoints`/
-`st_dumpsegments`), and I/O.
+or an operation that is undefined for the input also yields `NULL`. The catalog
+covers constructors, accessors, predicates, measurements, set ops, transforms,
+validity, four aggregates (`st_collect`, `st_envelope_agg`, `st_union_agg`,
+`st_makeline_agg`), geodesic/geography (`st_distancesphere`, `*spheroid`, …),
+EWKT/EWKB/SRID, affine & segmentize transforms, line editing, GEOS topology,
+raster transform/statistics/pixel streaming, a set-returning `ST_Dump` family
+(`st_dump`/`st_dumppoints`/`st_dumpsegments`), and I/O.
+
+Current registry audit: **227 SQL functions** — 154 public `st_*`, 72 literal
+`sedona_st_*` bridge functions, and one extension-specific helper
+(`sedona_join`). 32 public `st_*` functions route to the literal SedonaDB kernel.
 
 See **[ROADMAP.md](./ROADMAP.md)** for a category-level capability matrix vs
-SedonaDB and PostGIS and the tiered plan. The literal SedonaDB bridge (below)
+SedonaDB and PostGIS and the current three-month plan. The literal SedonaDB
+bridge (below)
 means the real Apache SedonaDB kernels now run inside DuckDB, not just a
 reimplementation of them.
 
@@ -132,7 +137,7 @@ reimplementation of them.
 | `st_numpoints` | `(BLOB) → INTEGER` | vertex count |
 | `st_isvalid` | `(BLOB) → BOOLEAN` | `geo::Validation` |
 | `st_isempty` | `(BLOB) → BOOLEAN` | empty geometry |
-| `st_makevalid` | `(BLOB) → BLOB` | `buffer(0)` topology repair |
+| `st_makevalid` | `(BLOB) → BLOB` | GEOS `make_valid` |
 | `st_geometrytype` | `(BLOB) → VARCHAR` | variant match |
 | `st_dimension` | `(BLOB) → INTEGER` | OGC dimension |
 | `st_affine` | `(BLOB, DOUBLE×6) → BLOB` | 2D affine matrix |
@@ -197,7 +202,9 @@ symbols at load time. The produced shared object exports the entry-point symbol
 | DuckDB 1.5.x | runtime host | loadable-extension host | ABI is 1.5.4 (`libduckdb-sys 1.10504.0`); built with the `loadable-extension` feature |
 | **`quack-rs`** | build (statically linked) | DuckDB C-API SDK; **vendored + patched** | upstream's `VectorReader::read_blob` validated UTF-8 and dropped binary WKB bytes (the README's original bug); the vendored copy fixes `read_blob` at the source and adds `Value::as_blob` for table-function bind params. See [vendor/quack-rs/PATCHES.md](./vendor/quack-rs/PATCHES.md). |
 | **PROJ (`libproj`)** | **build**: bundled & **statically linked** (`proj-sys/bundled_proj` + `libsqlite3-sys/bundled`) | `ST_Transform` (CRS reprojection) | Our own PROJ is **static** → `ST_Transform` has **no runtime dep** of its own. (But GDAL, below, brings its own dynamic libproj.) |
-| **GDAL (`libgdal` ≥ 3.13)** | **build (`pkg-config gdal` + `LIBCLANG_PATH` for bindgen) + runtime (`LD_LIBRARY_PATH`)** | **Raster** (`st_raster_info`, `st_raster_stats`, …) via a **vendored + patched** `gdal` 0.19 crate (only the high-level `gdal` crate is vendored; `gdal-sys` comes unpatched from crates.io — see `vendor/gdal/PATCHES.md`). | `LOAD` needs `libgdal.so` (and its transitive `libproj`/`libsqlite3`) resolvable. |
+| **GDAL (`libgdal` ≥ 3.13)** | **build (`pkg-config gdal` + `LIBCLANG_PATH` for bindgen) + runtime (`LD_LIBRARY_PATH`)** | **Raster** (`st_raster_info`, `st_raster_stats`, `st_raster_transform`, `st_pixeldata`) via a **vendored + patched** `gdal` 0.19 crate (only the high-level `gdal` crate is vendored; `gdal-sys` comes unpatched from crates.io — see `vendor/gdal/PATCHES.md`). | `LOAD` needs `libgdal.so` (and its transitive libs) resolvable. |
+| **GEOS (`libgeos_c`)** | build (`pkg-config geos`) + runtime | PostGIS-grade topology/editing: `st_node`, `st_polygonize`, `st_buildarea`, `st_voronoipolygons`, `st_snap`, `st_makevalid` | same canonical engine PostGIS uses for these hard planar-topology operations |
+| GeographicLib (`geographiclib-rs`) | build only (statically linked) | Karney spheroid geodesics: `st_distancespheroid`, `st_lengthspheroid`, `st_areaspheroid`, `st_dwithinspheroid` | converges on antipodal inputs |
 | arrow / parquet (Rust crates) | build only (statically linked) | `sedona_join` (R-tree spatial join over spilled parquet) | no runtime dep |
 | **Apache SedonaDB** (`sedona-functions` + `sedona-expr`/`schema`, git rev `b23ccd15`) + `datafusion-expr`/`-common` | build only (statically linked) | the **literal SedonaDB bridge** — real SedonaDB DataFusion UDFs invoked via DuckDB⇄Arrow (`src/bridge.rs`) | pure-Rust; no GDAL/PROJ/GEOS added |
 | `geo`/`wkb`/`wkt`/`geo-traits`/`delaunator`/`rstar` | build only | the ST_* geometry surface, Delaunay/Voronoi, the R-tree | pure-Rust, statically linked |
@@ -209,7 +216,7 @@ export LIBCLANG_PATH="$(brew --prefix llvm)/lib"               # bindgen needs l
 cargo build --release
 ./target/release/sedonadb-package target/release/libsedonadb.so build/dev/sedonadb.duckdb_extension linux_amd64
 ```
-**Load it** (GDAL runtime libs):
+**Load it** (GDAL/GEOS runtime libs):
 ```sh
 LD_LIBRARY_PATH="$(brew --prefix gdal)/lib" duckdb -unsigned
 duckdb> LOAD '/abs/path/sedonadb.duckdb_extension';
@@ -272,10 +279,11 @@ Note: DuckDB 1.5 also ships its own `GEOMETRY`-returning `ST_GeomFromWKB`; to
 avoid overload ambiguity, call sedonadb's functions on the raw `BLOB` column
 directly (they accept WKB natively) and `CAST(... AS BLOB)` literals.
 
-> **Runtime dependency:** since `ST_Transform` was wired in (PROJ), the
-> extension links `libproj.so` — set `LD_LIBRARY_PATH` (or install libproj
-> system-wide) before `LOAD`, e.g.
-> `LD_LIBRARY_PATH=/opt/homebrew/lib duckdb -unsigned`.
+> **Runtime dependency:** the full-capability build links dynamic GDAL and GEOS
+> (`libgdal.so`, `libgeos_c.so`, plus GDAL transitives as needed). Set
+> `LD_LIBRARY_PATH` (or install those libs system-wide) before `LOAD`, e.g.
+> `LD_LIBRARY_PATH=/opt/homebrew/lib duckdb -unsigned`. `ST_Transform` uses the
+> bundled/static PROJ path; GDAL may still bring its own dynamic PROJ.
 
 ### PostGIS compatibility & common workflows
 
@@ -293,22 +301,62 @@ SELECT st_astext(st_transform(st_geomfromtext('POINT(-0.1278 51.5074)'), 4326, 3
 SELECT st_distancesphere(st_point(-0.1278, 51.5074), st_point(2.3522, 48.8566));
 -- → ~343 km (London → Paris)
 
+-- WGS84 spheroid geodesics (Karney/GeographicLib, antipodal-safe)
+SELECT st_distancespheroid(st_point(-0.1278, 51.5074), st_point(2.3522, 48.8566));
+
 -- Bbox prefilter + exact predicate for inline spatial joins (no extension call)
 SELECT a.id, b.id FROM a JOIN b
   ON a._xmin <= b._xmax AND a._xmax >= b._xmin
  AND a._ymin <= b._ymax AND a._ymax >= b._ymin
  WHERE st_intersects(a.geom, b.geom);
 
--- Literal SedonaDB kernel vs local — same algorithm, two code paths
+-- Literal SedonaDB kernel vs public ST_* route — same canonical implementation
 SELECT st_dimension(geom), sedona_st_dimension(geom) FROM t;  -- identical
+
+-- Raster map algebra is plain DuckDB SQL over streamed pixels
+SELECT avg(value) FROM st_pixeldata('raster.tif', 1) WHERE value > 100;
 ```
 
-**Known deltas from PostGIS:** geometries are 2D WKB (Z/M ordinate values are
-not preserved through the local transform stack — use the literal `sedona_st_*`
-Z/M constructors/accessors for full-dimension work); there are no PostgreSQL
-operators (`&&`, `<->`) or GiST indexes (use `sedona_join` or the bbox
-prefilter); SRIDs are not embedded in the BLOB (CRS is an opt-in sidecar via
-`sedona_st_geomfromewkt_crs`).
+### Semantic deltas from PostGIS
+
+| Area | PostGIS | This extension | Workaround |
+|------|---------|----------------|------------|
+| **Dimensionality** | Full 3D/Z-M through the pipeline | 2D WKB local stack; Z/M via literal `sedona_st_*` constructors/accessors | Use `sedona_st_pointz/m/zm`, `sedona_st_force3d/3dm/4d` |
+| **Operators** | `&&`, `<->`, KNN/GiST | No PG operators; `sedona_join` table fn + bbox prefilter columns | `sedona_join(...)` or `ST_XMin/Max/YMin/MaxY` columns + DuckDB IEJoin |
+| **SRID** | Embedded in EWKB/typmod | SRID-less BLOB; CRS is an opt-in sidecar | `sedona_st_geomfromewkt_crs`, `sedona_st_setcrs_crs` |
+| **ST_Collect** | Both scalar `(g,g)` and aggregate `(g)` | Aggregate only (DuckDB can't overload scalar+aggregate on same name) | Wrap in subquery: `SELECT st_collect(geom) FROM (VALUES (g1), (g2)) t(geom)` |
+| **Empty geometry dim** | `ST_Dimension(EMPTY)` = -1 (OGC) | Returns 0 (matches SedonaDB) | Documented; both paths agree |
+| **Spheroid parameter** | `ST_DistanceSpheroid(…, 'SPHEROID[…]'::spheroid)` | WGS84 only (Karney/GeographicLib) | Hardcoded WGS84; custom spheroid not yet supported |
+| **Topology schema** | `topology.topology` subsystem | Not available | Out of scope (PG-specific) |
+
+### Migration examples
+
+```sql
+-- Load GeoParquet (DuckDB reads Parquet natively; geometry is WKB BLOB)
+COPY (SELECT * FROM read_parquet('data.parquet')) TO 'spatial.db';
+ATTACH 'spatial.db' AS db;
+
+-- Transform CRS, then bbox-prefilter join (no GiST needed)
+SELECT a.id, b.id
+FROM   db.buildings a JOIN db.parcels b
+       ON a._xmin <= b._xmax AND a._xmax >= b._xmin
+      AND a._ymin <= b._ymax AND a._ymax >= b._ymin
+WHERE  st_intersects(st_transform(a.geom, 4326, 3857), b.geom);
+
+-- Dissolve by category (cascaded polygonal union)
+SELECT category, st_union_agg(geom) AS geom FROM db.parcels GROUP BY category;
+
+-- Dump to atomic geometries for per-feature processing
+SELECT id, (d).path, st_astext((d).geom)
+FROM (SELECT id, st_dump(geom) AS d FROM db.collections) t;
+
+-- Raster reclassification (SQL map algebra via pixel streaming)
+SELECT row, col,
+       CASE WHEN value > 80 THEN 3
+            WHEN value > 40 THEN 2
+            ELSE 1 END AS reclass
+FROM   st_pixeldata('elevation.tif', 1);
+```
 
 ## Indexed spatial join (`sedona_join`)
 
@@ -372,25 +420,28 @@ unwrapped to the WKB `item` at the extension's native SRID-less fidelity; a
 missing/renamed UDF or an invoke error **fails closed to NULL** rather than
 crashing (critical under the release `panic = "abort"`).
 
-The registered SQL names are prefixed `sedona_` so they sit **side-by-side**
-with the existing implementations (same algorithm, two code paths):
+The registered SQL names are prefixed `sedona_` so provenance is explicit. For
+routed functions, `st_*` and `sedona_st_*` share the literal SedonaDB kernel; for
+unrouted functions, the pair remains useful for fidelity comparisons:
 
 ```sql
--- Both call the same kernel; sedona_* runs Apache SedonaDB's own code.
-SELECT st_dimension(geom);           -- our geo-crate implementation
-SELECT sedona_st_dimension(geom);     -- Apache SedonaDB's implementation
+-- For routed functions, both names use the same literal SedonaDB kernel.
+SELECT st_dimension(geom);
+SELECT sedona_st_dimension(geom);
 ```
 
-47 functions bridged (one registry line each): accessors
+72 functions bridged (one registry line each): accessors
 (`sedona_st_{x,y,z,m,xmin,xmax,ymin,ymax,zmin,zmax,mmin,mmax,dimension,
 numpoints,numgeometries,geometrytype,isempty,isclosed,iscollection,hasz,hasm,zmflag}`),
 geometry transforms
-(`sedona_st_{envelope,reverse,flipcoordinates,startpoint,endpoint,force2d,points,
-segmentize,geometryn,pointn,interiorringn,setsrid,translate,scale,linesubstring,
-makeline,rotate,rotate_x,rotate_y,point,geogpoint}`), measurements
-(`sedona_st_{azimuth}`), serialization (`sedona_st_{asbinary,asewkb}`), the
-constructor `sedona_st_geomfromewkt`, and the CRS sidecar
-`sedona_st_geomfromewkt_crs` (extracts SedonaDB's CRS string, e.g. `OGC:CRS84`).
+(`sedona_st_{envelope,reverse,flipcoordinates,startpoint,endpoint,force2d,force3d,
+force3dm,force4d,points,segmentize,geometryn,pointn,interiorringn,setsrid,
+translate,scale,linesubstring,makeline,rotate,rotate_x,rotate_y,point,pointz,
+pointm,pointzm,geogpoint}`), WKT/WKB constructors (`geomfromwkt`, `geomfromewkt`,
+`geomfromwkb`, typed line/point/polygon/multi constructors), measurements
+(`sedona_st_{azimuth}`), serialization (`sedona_st_{asbinary,asewkb}`), SRID/CRS
+helpers, and CRS sidecars such as `sedona_st_geomfromewkt_crs` (extracts
+SedonaDB's CRS string, e.g. `OGC:CRS84`).
 The entire `sedona_functions::register::default_function_set()` is reachable by
 appending lines to `registry.rs`. SQL regression: `tests/sedona_bridge.sql`; fidelity
 diff vs the local reimplementation: `tests/fidelity.sql`; overhead bench:
@@ -445,7 +496,8 @@ src/
   dump.rs       — ST_Dump / ST_DumpPoints / ST_DumpSegments table functions
   bridge.rs     — DuckDB-chunk ⇄ Arrow bridge to the real Apache SedonaDB DataFusion UDFs
   spatial_join.rs — sedona_join (R-tree spatial join over spilled parquet)
-  raster.rs     — st_raster_info / st_raster_stats (vendored GDAL)
+  geos_backend.rs — GEOS topology/editing backend (WKB → GEOS → WKB)
+  raster.rs     — st_raster_info / st_raster_stats / st_raster_transform / st_pixeldata
   bin/package.rs— appends the 512-byte DuckDB metadata trailer (.duckdb_extension)
 vendor/
   quack-rs/     — vendored SDK (binary-safe read_blob + Value::as_blob; see PATCHES.md)
@@ -460,14 +512,14 @@ What the brief's "Future work" section asked for, and where it stands:
 
 | Item | Status |
 | --- | --- |
-| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — ~130 functions now, incl. DE-9IM predicates, transforms, affine/segmentize/line editing, `ST_TriangulatePolygon`, `ST_MinimumBoundingCircle`/`MinimumClearance`, `ST_MakeEnvelope`/`MakePolygon`, `ST_Dump` family, `ST_Collect`/`ST_Union`/`ST_Envelope`/`ST_MakeLine` aggregates |
+| **Constructor/accessor parity** (`ST_GeomFromText`, `ST_AsText`, `ST_AsBinary`, `ST_Point`, …) | ✅ Done — broad catalog incl. DE-9IM predicates, transforms, affine/segmentize/line editing, `ST_TriangulatePolygon`, `ST_MinimumBoundingCircle`/`MinimumClearance`, `ST_MakeEnvelope`/`MakePolygon`, `ST_Dump` family, `ST_Collect`/`ST_Union`/`ST_Envelope`/`ST_MakeLine` aggregates |
 | **Robustness on real-world (invalid / over-complex) polygons** | ✅ Done — `ST_MakeValid` + an internal `ensure_valid` guard across all relate/boolean ops, plus a custom iterative ray-cast PIP for `ST_Within`/`ST_Contains` (so 100k+ vertex polygons no longer crash). See `benchmarks/BENCHMARKS.md`. |
 | **Spatial joins at scale** | ✅ Done — two paths: (1) `sedona_join(a.parquet, b.parquet, predicate)` R*-tree table function over spilled parquet (the disk-spill model); (2) inline bbox-prefilter (`ST_XMin/Max/YMin/MaxY` + DuckDB IEJoin). |
-| **Geography (geodesic)** | ✅ Done — `ST_DistanceSphere/DWithinSphere/LengthSphere/AreaSphere` (lon/lat → metres/m²). |
-| **CRS / PROJ (`ST_Transform`)** | ✅ Done — `ST_Transform(geom, from_srid, to_srid)` via PROJ. Runtime dep: `libproj.so`. |
+| **Geography (geodesic)** | ✅ Done — sphere + WGS84 spheroid `ST_Distance/DWithin/Length/Area` variants (lon/lat → metres/m²). |
+| **CRS / PROJ (`ST_Transform`)** | ✅ Done — `ST_Transform(geom, from_srid, to_srid)` via bundled/static PROJ. |
 | **Non-flat (dictionary/sequence/constant) input vectors** | ✅ Done — `ORDER BY … LIMIT`, filter/projection, and constant folding now feed dictionary/sequence/constant vectors into scalar `ST_*` (and `sedona_*`) callbacks without segfaulting. Resolved by the vendored binary-safe `VectorReader::read_blob`; pinned by `tests/vector_encodings.sql`. |
-| **Bridge to real Apache SedonaDB DataFusion UDFs** (`sedona-functions::default_function_set`) | ✅ Done — `src/bridge.rs` links the real `sedona-functions` workspace and invokes SedonaDB's own kernels through a DuckDB-chunk ⇄ Arrow bridge; 12 `sedona_*` functions registered side-by-side, runtime-verified. |
-| **Raster / map algebra**, **3D Z/M + SFCGAL**, `ST_VoronoiPolygons`, topology | ✅ Raster core (vendored GDAL: `st_raster_info`/`st_raster_stats`) + `ST_DelaunayTriangles`/`ST_VoronoiLines`/`ST_TriangulatePolygon` done. Map-algebra/`ST_AsRaster`/bounded Voronoi polygons open. 3D/SFCGAL has no mature Rust binding (out of reach); topology is niche. Static PROJ now bundled. |
+| **Bridge to real Apache SedonaDB DataFusion UDFs** (`sedona-functions::default_function_set`) | ✅ Done — `src/bridge.rs` links the real `sedona-functions` workspace and invokes SedonaDB's own kernels through a DuckDB-chunk ⇄ Arrow bridge; 72 `sedona_st_*` functions registered side-by-side, runtime-verified. |
+| **Raster / map algebra**, **3D Z/M + SFCGAL**, `ST_VoronoiPolygons`, topology | ✅ Raster pixel streaming (`st_pixeldata`) + transform/stat helpers + GEOS topology/Voronoi/Snap/MakeValid + `ST_DelaunayTriangles`/`ST_VoronoiLines`/`ST_TriangulatePolygon` done. Open: `ST_AsRaster`, raster clip/value helpers, `ST_Subdivide`. 3D/SFCGAL has no mature Rust binding (out of reach). |
 
 These map onto the brief's dependency table: the DuckDB interface stays stable
 through the C-API, while SedonaDB remains a plain `cargo update`.

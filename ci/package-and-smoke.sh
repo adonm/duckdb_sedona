@@ -36,7 +36,8 @@ echo ">> package $SO -> $EXT ($PLATFORM)"
 ./target/release/sedonadb-package "$SO" "$EXT" "$PLATFORM"
 
 echo ">> smoke-test in DuckDB ($DUCKDB)"
-# Three smoke checks: local path, literal SedonaDB path, and an aggregate.
+# Six smoke checks covering all backends: local geo, literal SedonaDB,
+# aggregate, GEOS topology, spheroid geodesics, and raster pixel streaming.
 "$DUCKDB" -unsigned <<SQL
 LOAD '$(pwd)/$EXT';
 .mode list
@@ -49,6 +50,13 @@ SELECT CASE WHEN sedona_st_astext(st_geomfromtext('POINT(1 2)')) = 'POINT(1 2)'
 SELECT CASE WHEN st_area(st_envelope_agg(g)) > 0
             THEN 'PASS aggregate' ELSE 'FAIL aggregate' END
 FROM (SELECT st_geomfromtext('POLYGON((0 0,1 0,1 1,0 1,0 0))') AS g);
+SELECT CASE WHEN st_numgeometries(st_voronoipolygons(st_geomfromtext(
+            'MULTIPOINT((0 0),(1 0),(0 1),(1 1))'))) >= 4
+            THEN 'PASS geos' ELSE 'FAIL geos' END;
+SELECT CASE WHEN st_distancespheroid(st_point(0,0), st_point(1,0)) > 100000.0
+            THEN 'PASS spheroid' ELSE 'FAIL spheroid' END;
+SELECT CASE WHEN (SELECT count(*) FROM st_pixeldata('tests/data/test_raster.asc', 1)) = 12
+            THEN 'PASS raster' ELSE 'FAIL raster' END;
 SQL
 
 echo ">> smoke OK: packaged extension loads and runs both paths"
