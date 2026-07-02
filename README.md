@@ -6,6 +6,12 @@ functions over WKB-encoded geometries, built in pure Rust with
 `wkb` / `geo` / `geo-traits` stack that
 [Apache SedonaDB](https://github.com/apache/sedona-db) builds on.
 
+Target: a **highest-fidelity SedonaDB/PostGIS-style spatial engine for DuckDB** —
+literal Apache SedonaDB kernels as the canonical implementation wherever they
+exist, a familiar PostGIS-like `ST_*` SQL namespace for users, explicit/documented
+semantic deltas where exact compatibility is not feasible, and maintainable
+vectorized executors rather than per-function FFI.
+
 ```sql
 INSTALL sedonadb;
 LOAD sedonadb;
@@ -271,6 +277,39 @@ directly (they accept WKB natively) and `CAST(... AS BLOB)` literals.
 > system-wide) before `LOAD`, e.g.
 > `LD_LIBRARY_PATH=/opt/homebrew/lib duckdb -unsigned`.
 
+### PostGIS compatibility & common workflows
+
+The `ST_*` namespace mirrors PostGIS names, arities, and units. Where Apache
+SedonaDB has the same function, `st_*` routes to the **literal SedonaDB kernel**
+(one implementation; `sedona_st_*` is the explicit provenance twin). A few
+DuckDB-native shapes differ by necessity (noted below).
+
+```sql
+-- CRS reprojection (PROJ): EPSG:4326 → 3857 (web mercator)
+SELECT st_astext(st_transform(st_geomfromtext('POINT(-0.1278 51.5074)'), 4326, 3857));
+-- → POINT(-14227.16 6711542.71)
+
+-- Geodesic distance (metres) over lon/lat points — no projection needed
+SELECT st_distancesphere(st_point(-0.1278, 51.5074), st_point(2.3522, 48.8566));
+-- → ~343 km (London → Paris)
+
+-- Bbox prefilter + exact predicate for inline spatial joins (no extension call)
+SELECT a.id, b.id FROM a JOIN b
+  ON a._xmin <= b._xmax AND a._xmax >= b._xmin
+ AND a._ymin <= b._ymax AND a._ymax >= b._ymin
+ WHERE st_intersects(a.geom, b.geom);
+
+-- Literal SedonaDB kernel vs local — same algorithm, two code paths
+SELECT st_dimension(geom), sedona_st_dimension(geom) FROM t;  -- identical
+```
+
+**Known deltas from PostGIS:** geometries are 2D WKB (Z/M ordinate values are
+not preserved through the local transform stack — use the literal `sedona_st_*`
+Z/M constructors/accessors for full-dimension work); there are no PostgreSQL
+operators (`&&`, `<->`) or GiST indexes (use `sedona_join` or the bbox
+prefilter); SRIDs are not embedded in the BLOB (CRS is an opt-in sidecar via
+`sedona_st_geomfromewkt_crs`).
+
 ## Indexed spatial join (`sedona_join`)
 
 Because DuckDB's C API has no join-planner/index operators, `sedona_join`
@@ -342,7 +381,7 @@ SELECT st_dimension(geom);           -- our geo-crate implementation
 SELECT sedona_st_dimension(geom);     -- Apache SedonaDB's implementation
 ```
 
-35+ functions bridged (one registry line each): accessors
+47 functions bridged (one registry line each): accessors
 (`sedona_st_{x,y,z,m,xmin,xmax,ymin,ymax,zmin,zmax,mmin,mmax,dimension,
 numpoints,numgeometries,geometrytype,isempty,isclosed,iscollection,hasz,hasm,zmflag}`),
 geometry transforms

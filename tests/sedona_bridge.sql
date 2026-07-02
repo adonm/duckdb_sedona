@@ -93,3 +93,32 @@ SELECT CASE WHEN st_astext(sedona_st_rotate(st_geomfromtext('POINT(1 0)'), 1.570
 SELECT CASE WHEN sedona_st_geomfromewkt_crs('SRID=4326;POINT(1 2)') = 'OGC:CRS84' THEN 'PASS' ELSE 'FAIL sedona ewkt-crs 4326' END;
 SELECT CASE WHEN sedona_st_geomfromewkt_crs('SRID=3857;POINT(1 2)') = 'EPSG:3857' THEN 'PASS' ELSE 'FAIL sedona ewkt-crs 3857' END;
 SELECT CASE WHEN sedona_st_geomfromewkt_crs('POINT(1 2)') IS NULL THEN 'PASS' ELSE 'FAIL sedona ewkt-crs none' END;
+
+-- === P1: complete the literal surface — WKT/WKB constructors, dimension
+-- forcing, Z/M points, SRID. Struct-returning constructors are unwrapped to
+-- plain WKB at the extension's native SRID-less fidelity. ===
+-- WKT constructors round-trip through astext.
+SELECT CASE WHEN st_astext(sedona_st_geomfromwkt('POINT(1 2)')) = 'POINT(1 2)' THEN 'PASS' ELSE 'FAIL sedona geomfromwkt' END;
+SELECT CASE WHEN st_astext(sedona_st_linefromtext('LINESTRING(0 0,1 1)')) = 'LINESTRING(0 0,1 1)' THEN 'PASS' ELSE 'FAIL sedona linefromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_pointfromtext('POINT(3 4)')) = 'POINT(3 4)' THEN 'PASS' ELSE 'FAIL sedona pointfromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_polygonfromtext('POLYGON((0 0,1 0,1 1,0 0))')) = 'POLYGON((0 0,1 0,1 1,0 0))' THEN 'PASS' ELSE 'FAIL sedona polygonfromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_mlinefromtext('MULTILINESTRING((0 0,1 1))')) = 'MULTILINESTRING((0 0,1 1))' THEN 'PASS' ELSE 'FAIL sedona mlinefromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_mpointfromtext('MULTIPOINT((1 2))')) = 'MULTIPOINT((1 2))' THEN 'PASS' ELSE 'FAIL sedona mpointfromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_mpolyfromtext('MULTIPOLYGON(((0 0,1 0,1 1,0 0)))')) = 'MULTIPOLYGON(((0 0,1 0,1 1,0 0)))' THEN 'PASS' ELSE 'FAIL sedona mpolyfromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_geomcollfromtext('GEOMETRYCOLLECTION(POINT(1 2))')) = 'GEOMETRYCOLLECTION(POINT(1 2))' THEN 'PASS' ELSE 'FAIL sedona geomcollfromtext' END;
+SELECT CASE WHEN st_astext(sedona_st_geogfromwkt('POINT(5 6)')) = 'POINT(5 6)' THEN 'PASS' ELSE 'FAIL sedona geogfromwkt' END;
+-- WKB constructors (raw Binary input → geom).
+SELECT CASE WHEN st_astext(sedona_st_geomfromwkb(st_asbinary(st_geomfromtext('POINT(7 8)')))) = 'POINT(7 8)' THEN 'PASS' ELSE 'FAIL sedona geomfromwkb' END;
+SELECT CASE WHEN st_astext(sedona_st_geomfromewkb(st_asewkb(st_geomfromtext('POINT(9 10)')))) = 'POINT(9 10)' THEN 'PASS' ELSE 'FAIL sedona geomfromewkb' END;
+SELECT CASE WHEN st_astext(sedona_st_geomfromwkbunchecked(st_asbinary(st_geomfromtext('LINESTRING(0 0,2 2)')))) = 'LINESTRING(0 0,2 2)' THEN 'PASS' ELSE 'FAIL sedona geomfromwkbunchecked' END;
+-- SRID accessor (native WKB has no embedded SRID → 0).
+SELECT CASE WHEN sedona_st_srid(sedona_st_geomfromewkt('SRID=4326;POINT(1 2)')) = 0 THEN 'PASS' ELSE 'FAIL sedona srid' END;
+-- Dimension forcing sets the zm flag (0=XY, 1=XYM, 2=XYZ, 3=XYZM).
+SELECT CASE WHEN sedona_st_zmflag(sedona_st_force3d(st_geomfromtext('POINT(1 2)'), 9.0)) = 2 THEN 'PASS' ELSE 'FAIL sedona force3d' END;
+SELECT CASE WHEN sedona_st_zmflag(sedona_st_force3dm(st_geomfromtext('POINT(1 2)'), 9.0)) = 1 THEN 'PASS' ELSE 'FAIL sedona force3dm' END;
+SELECT CASE WHEN sedona_st_zmflag(sedona_st_force4d(st_geomfromtext('POINT(1 2)'), 9.0, 8.0)) = 3 THEN 'PASS' ELSE 'FAIL sedona force4d' END;
+-- Z/M point constructors. (Local st_astext is 2D-only and drops Z/M; the
+-- literal sedona_st_astext and sedona_st_zmflag read the full ordinate set.)
+SELECT CASE WHEN sedona_st_astext(sedona_st_pointz(1, 2, 3)) = 'POINT Z(1 2 3)' THEN 'PASS' ELSE 'FAIL sedona pointz' END;
+SELECT CASE WHEN sedona_st_astext(sedona_st_pointm(1, 2, 3)) = 'POINT M(1 2 3)' THEN 'PASS' ELSE 'FAIL sedona pointm' END;
+SELECT CASE WHEN sedona_st_astext(sedona_st_pointzm(1, 2, 3, 4)) = 'POINT ZM(1 2 3 4)' THEN 'PASS' ELSE 'FAIL sedona pointzm' END;

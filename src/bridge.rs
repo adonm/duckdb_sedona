@@ -417,6 +417,26 @@ pub fn unary_blob_to_blob(name: &'static str, input: duckdb_data_chunk, output: 
     }
 }
 
+/// `(binary WKB) → geom` — WKB constructors (`ST_GeomFromWKB`, `ST_GeomFromEWKB`).
+/// Unlike `unary_blob_to_blob`, the input is typed as raw `Binary` (not geometry)
+/// because these kernels match `is_binary()` and reject a geometry-typed arg.
+pub fn binary_to_blob(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let nrows = reader.row_count();
+    let arg = ColumnarValue::Array(Arc::new(read_blob_array(&reader, nrows)));
+    let udf = try_udf(name);
+    let stypes = [SedonaType::Arrow(DataType::Binary)];
+    let out = invoke(udf, vec![arg], &stypes, nrows);
+    let mut writer = unsafe { VectorWriter::new(output) };
+    match out {
+        Some(cv) => write_back(cv, &mut writer, nrows),
+        None => for row in 0..nrows {
+            unsafe { writer.set_null(row) };
+        },
+    }
+}
+
 /// `(geom) → INTEGER` (e.g. `st_dimension`, `st_numpoints`).
 pub fn unary_blob_to_int(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
     let chunk = unsafe { DataChunk::from_raw(input) };
@@ -573,6 +593,57 @@ pub fn doubles2_to_blob(name: &'static str, input: duckdb_data_chunk, output: du
     let udf = try_udf(name);
     let stypes = [SedonaType::Arrow(DataType::Float64), SedonaType::Arrow(DataType::Float64)];
     let out = invoke(udf, vec![arg0, arg1], &stypes, nrows);
+    let mut writer = unsafe { VectorWriter::new(output) };
+    match out {
+        Some(cv) => write_back(cv, &mut writer, nrows),
+        None => for row in 0..nrows {
+            unsafe { writer.set_null(row) };
+        },
+    }
+}
+
+/// Reads `ncols` Float64 columns from the chunk, emitting a `Scalar` when the
+/// column is a constant broadcast (so SedonaDB kernels that match on
+/// `ColumnarValue::Scalar` select the right arm). Shared by the Z/M point
+/// constructors (`ST_PointZ` = 3, `ST_PointM` = 3, `ST_PointZM` = 4).
+fn f64_args(input: duckdb_data_chunk, ncols: usize) -> (Vec<ColumnarValue>, Vec<SedonaType>, usize) {
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let first = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let nrows = first.row_count();
+    let mut args = Vec::with_capacity(ncols);
+    let mut stypes = vec![SedonaType::Arrow(DataType::Float64); ncols];
+    for col in 0..ncols {
+        let reader = unsafe { VectorReader::new(chunk.as_raw(), col) };
+        let arr = Arc::new(read_f64_array(&reader, nrows));
+        let cv = match f64_scalar(&arr) {
+            Some(s) => ColumnarValue::Scalar(s),
+            None => ColumnarValue::Array(arr),
+        };
+        args.push(cv);
+    }
+    let _ = &mut stypes; // keep stypes aligned with ncols
+    (args, stypes, nrows)
+}
+
+/// `(DOUBLE, DOUBLE, DOUBLE) → geom` (`ST_PointZ`, `ST_PointM`).
+pub fn doubles3_to_blob(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
+    let (args, stypes, nrows) = f64_args(input, 3);
+    let udf = try_udf(name);
+    let out = invoke(udf, args, &stypes, nrows);
+    let mut writer = unsafe { VectorWriter::new(output) };
+    match out {
+        Some(cv) => write_back(cv, &mut writer, nrows),
+        None => for row in 0..nrows {
+            unsafe { writer.set_null(row) };
+        },
+    }
+}
+
+/// `(DOUBLE, DOUBLE, DOUBLE, DOUBLE) → geom` (`ST_PointZM`).
+pub fn doubles4_to_blob(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
+    let (args, stypes, nrows) = f64_args(input, 4);
+    let udf = try_udf(name);
+    let out = invoke(udf, args, &stypes, nrows);
     let mut writer = unsafe { VectorWriter::new(output) };
     match out {
         Some(cv) => write_back(cv, &mut writer, nrows),

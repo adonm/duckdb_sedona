@@ -28,7 +28,7 @@ if [ ! -f "$EXT" ]; then
     exit 2
 fi
 
-SQL_FILES=(tests/all_functions.sql tests/sedona_bridge.sql tests/vector_encodings.sql tests/fidelity.sql)
+SQL_FILES=(tests/all_functions.sql tests/sedona_bridge.sql tests/vector_encodings.sql tests/fidelity.sql tests/edge_cases.sql)
 TOTAL_PASS=0
 TOTAL_FAIL=0
 FAILED_FILES=()

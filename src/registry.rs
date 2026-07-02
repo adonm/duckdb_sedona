@@ -430,7 +430,7 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // THE CATALOG. Add new SedonaDB-backed operations by appending a line.
     // ---------------------------------------------------------------------
     register_unary_geom!("st_convexhull", functions::convex_hull);
-    register_unary_geom!("st_envelope", functions::envelope);
+    // st_envelope is now literal-backed — see the bridge batch below.
     register_unary_geom!("st_centroid", functions::centroid);
     register_unary_geom!("st_geomfromwkb", functions::geom_from_wkb);
 
@@ -462,26 +462,17 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     }
 
     register_geom_double!("st_area", functions::area);
-    register_geom_double!("st_x", functions::x);
-    register_geom_double!("st_y", functions::y);
-    register_geom_double!("st_z", functions::z);
-    register_geom_double!("st_m", functions::m);
     register_geom_double!("st_length", functions::length);
     register_geom_double!("st_perimeter", functions::perimeter);
-    register_geom_double!("st_xmin", functions::xmin);
-    register_geom_double!("st_xmax", functions::xmax);
-    register_geom_double!("st_ymin", functions::ymin);
-    register_geom_double!("st_ymax", functions::ymax);
+    // st_x/y/z/m and bbox accessors (xmin..ymax) are now literal-backed — see
+    // the bridge batch below (one SedonaDB kernel, two SQL entry points).
 
-    register_geom_varchar!("st_geometrytype", functions::geometry_type);
-    register_geom_varchar!("st_astext", functions::as_text);
+    // st_geometrytype / st_astext are now literal-backed (see bridge batch).
     register_geom_varchar!("st_asgeojson", functions::as_geojson);
     register_geom_int_to_varchar!("st_asewkt", functions::as_ewkt);
 
-    register_geom_int!("st_dimension", functions::dimension);
-    register_geom_int!("st_numpoints", functions::num_points);
-    register_geom_int!("st_npoints", functions::num_points);
-    register_geom_int!("st_numgeometries", functions::num_geometries);
+    // st_dimension / st_numpoints / st_npoints / st_numgeometries are now
+    // literal-backed — see the bridge batch below.
     register_geom_int!("st_numinteriorrings", functions::num_interior_rings);
     register_geom_int!("st_coorddim", functions::coord_dim);
     register_geom_int!("st_zmflag", functions::zm_flag);
@@ -557,11 +548,8 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_geom_int2_to_geom!("st_transform", functions::transform);
 
     register_geom_bool!("st_isvalid", functions::is_valid);
-    register_geom_bool!("st_isempty", functions::is_empty);
-    register_geom_bool!("st_isclosed", functions::is_closed);
-    register_geom_bool!("st_iscollection", functions::is_collection);
-    register_geom_bool!("st_hasz", functions::has_z);
-    register_geom_bool!("st_hasm", functions::has_m);
+    // st_isempty / st_isclosed / st_iscollection / st_hasz / st_hasm are now
+    // literal-backed — see the bridge batch below.
     register_geom_bool!("st_isring", functions::is_ring);
 
     // --- constructors & mixed-type --------------------------------------
@@ -870,6 +858,62 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             }
         }};
     }
+    macro_rules! register_sedona_binary_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::binary_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_doubles3_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::doubles3_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_doubles4_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::doubles4_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
     macro_rules! register_sedona_blob_double2_blob {
         ($sql_name:expr, $sedona_name:expr) => {{
             unsafe extern "C" fn cb(
@@ -1068,6 +1112,72 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_sedona_blob_double_blob!("sedona_st_rotate", "st_rotate");
     register_sedona_blob_double_blob!("sedona_st_rotate_x", "st_rotate_x");
     register_sedona_blob_double_blob!("sedona_st_rotate_y", "st_rotate_y");
+
+    // --- P1: complete the literal SedonaDB scalar surface (literal-by-default) ---
+    // WKB constructors (BLOB EWKB -> geom; struct return unwrapped to WKB).
+    // Input typed as raw Binary — these kernels match is_binary(), not geometry.
+    register_sedona_binary_blob!("sedona_st_geomfromwkb", "st_geomfromwkb");
+    register_sedona_binary_blob!("sedona_st_geomfromewkb", "st_geomfromewkb");
+    register_sedona_binary_blob!("sedona_st_geomfromwkbunchecked", "st_geomfromwkbunchecked");
+    register_sedona_binary_blob!("sedona_st_geogfromwkb", "st_geogfromwkb");
+    // WKT constructors (VARCHAR -> geom; struct return unwrapped to WKB). The
+    // typed constructors mirror PostGIS names; SedonaDB accepts an optional SRID
+    // as a second arg, which we do not expose here (use *_crs for CRS metadata).
+    register_sedona_varchar_blob!("sedona_st_geomfromwkt", "st_geomfromwkt");
+    register_sedona_varchar_blob!("sedona_st_geogfromwkt", "st_geogfromwkt");
+    register_sedona_varchar_blob!("sedona_st_linefromtext", "st_linefromtext");
+    register_sedona_varchar_blob!("sedona_st_pointfromtext", "st_pointfromtext");
+    register_sedona_varchar_blob!("sedona_st_polygonfromtext", "st_polygonfromtext");
+    register_sedona_varchar_blob!("sedona_st_mlinefromtext", "st_mlinefromtext");
+    register_sedona_varchar_blob!("sedona_st_mpointfromtext", "st_mpointfromtext");
+    register_sedona_varchar_blob!("sedona_st_mpolyfromtext", "st_mpolyfromtext");
+    register_sedona_varchar_blob!("sedona_st_geomcollfromtext", "st_geomcollfromtext");
+    // SRID accessor (geom -> INTEGER; returns the SRID SedonaDB tracks).
+    register_sedona_blob_int!("sedona_st_srid", "st_srid");
+    // CRS sidecar: ST_SetCRS sets the CRS at the type level (returns item-crs).
+    register_sedona_blob_int_crs!("sedona_st_setcrs_crs", "st_set_crs");
+    // Dimension forcing (geom [, z] [, m] -> geom); optional doubles default in-kernel.
+    register_sedona_blob_double_blob!("sedona_st_force3d", "st_force3d");
+    register_sedona_blob_double_blob!("sedona_st_force3dm", "st_force3dm");
+    register_sedona_blob_double2_blob!("sedona_st_force4d", "st_force4d");
+    // Z/M point constructors (DOUBLE×N -> geom).
+    register_sedona_doubles3_blob!("sedona_st_pointz", "st_pointz");
+    register_sedona_doubles3_blob!("sedona_st_pointm", "st_pointm");
+    register_sedona_doubles4_blob!("sedona_st_pointzm", "st_pointzm");
+
+    // --- P1b: route proven-equivalent st_* accessors to the literal SedonaDB
+    // kernel (one implementation, two SQL entry points: st_* + sedona_st_*).
+    // These are pure scalar reads (int/bool/double) with zero formatting
+    // ambiguity; fidelity.sql + edge_cases.sql prove local == literal across
+    // empty/collection/nested/large-coord/Z-dim inputs. The local function
+    // bodies remain as dormant fallback but are no longer wired. ---
+    // (geom -> INTEGER)
+    register_sedona_blob_int!("st_dimension", "st_dimension");
+    register_sedona_blob_int!("st_numpoints", "st_npoints");
+    register_sedona_blob_int!("st_npoints", "st_npoints");
+    register_sedona_blob_int!("st_numgeometries", "st_numgeometries");
+    // (geom -> BOOLEAN)
+    register_sedona_blob_bool!("st_isempty", "st_isempty");
+    register_sedona_blob_bool!("st_isclosed", "st_isclosed");
+    register_sedona_blob_bool!("st_iscollection", "st_iscollection");
+    register_sedona_blob_bool!("st_hasz", "st_hasz");
+    register_sedona_blob_bool!("st_hasm", "st_hasm");
+    // (geom -> DOUBLE) — ordinates + bbox
+    register_sedona_blob_double!("st_x", "st_x");
+    register_sedona_blob_double!("st_y", "st_y");
+    register_sedona_blob_double!("st_z", "st_z");
+    register_sedona_blob_double!("st_m", "st_m");
+    register_sedona_blob_double!("st_xmin", "st_xmin");
+    register_sedona_blob_double!("st_xmax", "st_xmax");
+    register_sedona_blob_double!("st_ymin", "st_ymin");
+    register_sedona_blob_double!("st_ymax", "st_ymax");
+    // (geom -> VARCHAR) — text representation + type name (proven equivalent
+    // via fidelity.sql over the full corpus).
+    register_sedona_blob_varchar!("st_astext", "st_astext");
+    register_sedona_blob_varchar!("st_geometrytype", "st_geometrytype");
+    // (geom -> geom) — bounding rectangle (compared by area in fidelity.sql;
+    // ring winding may legitimately differ CCW/CW).
+    register_sedona_blob_blob!("st_envelope", "st_envelope");
 
     Ok(())
 }

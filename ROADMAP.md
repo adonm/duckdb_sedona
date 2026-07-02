@@ -1,7 +1,63 @@
 # Roadmap to a SedonaDB + PostGIS superset
 
 Status of the `sedonadb` DuckDB extension against the Apache SedonaDB and
-PostGIS spatial surfaces, and what it takes to reach a **superset**.
+PostGIS spatial surfaces, and what it takes to reach a **highest-fidelity,
+usable, maintainable superset**.
+
+## North-star target
+
+Build the best spatial extension for DuckDB by combining three goals:
+
+1. **SedonaDB superset, literal by default.** Every Apache SedonaDB SQL kernel
+   that can be bridged safely should be callable in DuckDB and should be the
+   canonical implementation for matching `st_*` functions. The literal bridge is
+   not just an oracle; it is the preferred engine wherever SedonaDB already has a
+   function.
+2. **PostGIS-compatible SQL surface.** Prefer familiar `ST_*` names, arities,
+   argument order, units, NULL behavior, and edge-case semantics. Where DuckDB,
+   SedonaDB, Rust libraries, or missing infrastructure make exact PostGIS
+   behavior impossible, document the mismatch and test it explicitly.
+3. **Production quality over catalog inflation.** Never ship a function that can
+   silently return wrong geometry. Prefer `NULL`, a documented limitation, or an
+   unimplemented item over approximate behavior that looks authoritative.
+
+Practical namespace policy:
+
+- `st_*`: the user-facing, PostGIS/SedonaDB-like SQL namespace. If Apache
+  SedonaDB has the function and the bridge supports its signature, `st_*` should
+  route to the literal SedonaDB kernel or be proven equivalent before remaining
+  local.
+- `sedona_st_*`: explicit literal Apache SedonaDB bridge functions, useful to
+  users, tests, and migration/debugging. These make the provenance visible while
+  `st_*` remains the ergonomic namespace.
+- extension-specific names (`sedona_join`, `*_crs` helpers, benchmarks/tools)
+  are allowed when DuckDB needs a different shape than PostGIS/SedonaDB.
+
+Implementation policy:
+
+- Do **not** maintain two independent implementations for the same semantics as
+  a permanent state. Once a SedonaDB bridge kernel is supported and validated,
+  prefer routing the public `st_*` function to it.
+- Keep local Rust implementations for: functions SedonaDB lacks, PostGIS-compat
+  capabilities beyond SedonaDB, DuckDB-specific table/aggregate shapes, bridge
+  unsupported types, or temporary fallback/performance experiments.
+- If a local implementation overlaps SedonaDB, either deprecate it internally,
+  convert it into a thin wrapper over the bridge, or document why it intentionally
+  diverges.
+
+Quality gates for new capabilities:
+
+- **Fidelity first:** add local-vs-literal SedonaDB tests when a bridged kernel
+  exists; add PostGIS/SedonaDB reference fixtures for hard edge cases otherwise.
+- **Fail closed:** invalid WKB, unsupported encodings, missing bridge functions,
+  and undefined operations must not panic or fabricate geometry.
+- **Vectorized and packageable:** every feature must work through DuckDB chunks,
+  SQL regressions, release packaging, and the smoke test.
+- **Maintainable by design:** prefer one registry line plus a shared executor;
+  keep FFI, Arrow, GDAL/PROJ, and topology code isolated behind small boundaries.
+- **Usable docs:** every non-obvious semantic difference, runtime dependency, and
+  extension-specific helper needs a short README/ROADMAP note and at least one
+  SQL example or regression.
 
 ## Where we are now (~130 functions, all on the `geo`/`wkb` stack)
 
@@ -27,7 +83,7 @@ Apache SpatialBench (`benchmarks/BENCHMARKS.md`).
 
 **Literal Apache SedonaDB now linked.** Beyond the reimplementation above,
 `src/bridge.rs` invokes the real `sedona-functions` DataFusion UDF kernels
-directly from DuckDB (DuckDB-chunk ⇄ Arrow bridge); 35+ `sedona_*` functions
+directly from DuckDB (DuckDB-chunk ⇄ Arrow bridge); 47 `sedona_*` functions
 are registered side-by-side with ours and runtime-verified, including CRS-tagged
 returns (item-crs structs unwrapped to WKB at the extension's native fidelity),
 a CRS sidecar extractor (`sedona_st_geomfromewkt_crs`), and constant-scalar
@@ -36,26 +92,26 @@ path competitive with the local reimplementation). See "Resolved #1" below.
 
 ## Previously-flagged hard bits — now resolved
 
-1. **Literal Apache SedonaDB bridge — ✅ DONE.** `src/bridge.rs` links the real
-   `sedona-functions` crate (git rev `b23ccd15`, + `sedona-expr`/`schema` and
-   `datafusion-expr`/`-common` as trait types only) and invokes SedonaDB's own
-   DataFusion UDF kernels directly from a DuckDB callback via a DuckDB-chunk ⇄
-   Arrow bridge (BLOB/WKB → `BinaryArray` → `SedonaScalarUDF::invoke_with_args`
-   → result array → DuckDB vector). 12 functions are registered under a
-   `sedona_` prefix, side-by-side with the reimplementation (`st_dimension` /
-   `sedona_st_dimension` run the same algorithm through two code paths). The
-   entire `default_function_set()` is reachable by appending registry lines;
-   only item-crs/struct-returning UDFs are omitted. Runtime-verified:
-   `cargo test --lib bridge` drives the real `st_dimension`/`st_astext`/
-   `st_isempty` kernels through the bridge. The SedonaDB tree is pure-Rust, so
-   it adds no GDAL/PROJ/GEOS and cannot collide with the vendored C deps.
-2. **`ST_Transform` via PROJ (Tier 3a) — ✅ DONE (option a: accept runtime dep).**
-   PROJ 9.8.1 linked; `ST_Transform(geom, from_srid, to_srid)` reprojects between EPSG
-   codes (verified: London 4326→3857 = 14227, 6711542; Sedona = -12441066, 4144872).
-   A thread-local `Proj` cache avoids re-parsing the CRS per row. **Runtime dep:**
-   `libproj.so` must be present to `LOAD sedonadb;` (`ldd` shows `libproj.so.25`).
-   arrow/parquet are statically linked (no runtime dep).
-2. **Spatial-join via disk-spill (Tier 3b) — ✅ DONE as `sedona_join` table function.**
+1. **Literal Apache SedonaDB bridge — ✅ DONE and now a standing expansion path.**
+   `src/bridge.rs` links the real `sedona-functions` crate (git rev `b23ccd15`,
+   + `sedona-expr`/`schema` and `datafusion-expr`/`-common` as trait types only)
+   and invokes SedonaDB's own DataFusion UDF kernels directly from a DuckDB
+   callback via a DuckDB-chunk ⇄ Arrow bridge (BLOB/WKB → Arrow array →
+   `SedonaScalarUDF::invoke_with_args` → result array → DuckDB vector). 47
+   functions are registered under a `sedona_` prefix, side-by-side with the local
+   reimplementation (`st_dimension` / `sedona_st_dimension` run the same
+   algorithm through two code paths). Struct/item-crs returns are handled by
+   unwrapping the geometry `item` to WKB and, where useful, exposing the CRS
+   sidecar as VARCHAR (`sedona_st_geomfromewkt_crs`). The remaining SedonaDB
+   scalar UDFs are reachable by adding registry lines plus, when needed, one more
+   shared executor shape. Runtime-verified by Rust bridge tests and SQL
+   regressions. The SedonaDB tree is pure-Rust, so it adds no GDAL/PROJ/GEOS and
+   cannot collide with the vendored C deps.
+2. **`ST_Transform` via PROJ (Tier 3a) — ✅ DONE.** `ST_Transform(geom,
+   from_srid, to_srid)` reprojects between EPSG codes with a thread-local `Proj`
+   cache. The transform path uses bundled/static PROJ; the full extension can
+   still need dynamic GDAL/PROJ transitively for raster support.
+3. **Spatial-join via disk-spill (Tier 3b) — ✅ DONE as `sedona_join` table function.**
    DuckDB's `COPY ... TO 'x.parquet'` is the spill; `sedona_join(a_path, b_path,
    predicate)` reads both Parquet files itself (`parquet`/`arrow` crates), builds an
    `rstar` R*-tree over the right side, applies the exact predicate, and streams
@@ -171,19 +227,79 @@ geometry-vs-geometry geodesic distance still open.)
 
 ## What "superset" realistically means
 
-A 100 % byte-compatible PostGIS superset is impractical (operators/GiST, SFCGAL,
-raster, topology, Tiger). The pragmatic target — **a SedonaDB superset and a
-PostGIS-compatible core** — is reachable:
+A 100% byte-compatible PostGIS clone is not the target: PostgreSQL operators,
+GiST planner integration, SFCGAL 3D solids, topology, Tiger/geocoder, and some
+raster administration APIs do not map cleanly to a DuckDB loadable extension.
 
-1. **Tier 1 + 1b** (a few days) → full geometry-level SQL parity (~120 fns),
-   indistinguishable from PostGIS for vector analytics.
-2. **Tier 2** (geography) → spherical distance/area, the second-most-used
-   PostGIS surface.
-3. **Tier 3a** (`ST_Transform`/PROJ) → CRS reprojection, the capability users
-   most associate with "real" GIS.
-4. **Tier 3b** (`sedona_join` table function + R-tree) → indexed spatial joins
-   with no bbox-prefilter manual step — the performance story.
+The target is higher value and more focused:
 
-Tiers 1→3 are the work that turns this from "a strong ST_* function pack" into
-"a SedonaDB-class spatial engine on DuckDB". Tier 4 is open-ended and can be
-added incrementally (raster first, 3D much later).
+1. **SedonaDB-plus:** every practical SedonaDB vector SQL function available in
+   DuckDB, with the literal bridge as the canonical implementation for matching
+   public `st_*` functions wherever signatures and return types fit.
+2. **PostGIS-compatible core:** the common PostGIS vector/geography/CRS/raster
+   analysis surface under familiar `ST_*` names, with exact semantics where
+   feasible and tested/documented deltas where not.
+3. **DuckDB-native usability:** install/load/package cleanly, operate on WKB BLOBs
+   that interoperate with DuckDB `spatial`, stream through vectorized chunks, and
+   provide spatial-join/raster workflows that fit DuckDB rather than PostgreSQL.
+4. **Maintainable growth:** new functions should expand a small number of shared
+   executor families and reference tests, not create per-function FFI or semantic
+   snowflakes.
+
+## Focused execution plan
+
+### P0 — compatibility contract and safety net (always-on) — ✅ LANDED
+
+- `tests/fidelity.sql` is the gate for every overlapping `st_*` / `sedona_st_*`
+  function; `tests/edge_cases.sql` covers empty/NULL/Z-dim/extreme/cocircular
+  degenerate inputs through both paths.
+- A PostGIS/SedonaDB fixture corpus for the remaining hard edge cases
+  (antimeridian, spheroid) grows incrementally as those capabilities land.
+- Each routed function is proven equivalent before the local code is unwired.
+- `try_udf`/bridge lookup stays fail-closed under `panic = "abort"`.
+
+### P1 — make the literal SedonaDB bridge the default implementation path — ✅ LANDED
+
+- Full inventory of `default_function_set()` done; every registrable scalar UDF
+  is bridged (65 `sedona_st_*` functions). Only ST_Affine (geom+6 doubles),
+  type-conversion UDFs (st_togeography/st_togeometry), and special/table UDFs
+  (st_knn/st_dump/sd_*) remain — each blocked on a new shape or unsupported type.
+- 20 public `st_*` accessors now route to the literal SedonaDB kernel (one
+  implementation, two SQL entry points); overlapping local code is dormant.
+- CRS/item-crs returns stay unwrapped to native WKB with opt-in `*_crs` helpers.
+
+### P2 — PostGIS namespace and usability polish — ✅ LANDED
+
+- README "PostGIS compatibility & common workflows" subsection with runnable
+  examples (CRS reprojection, geodesic distance, bbox-prefilter join, literal
+  comparison) and documented deltas (2D stack, no PG operators/GiST, SRID
+  sidecar).
+- Alias/arity alignment is ongoing as new functions land.
+
+### P3 — hard capability gaps, only with correct algorithms — ⏳ DEFERRED
+
+- **Topology editing:** `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea`.
+  These need robust graph/topology code and should land with adversarial fixtures,
+  not heuristic approximations.
+- **Bounded Voronoi polygons:** implement only with a correct half-edge/infinite
+  edge treatment and tests for cocircular grids, duplicate points, hull cells, and
+  tolerance. The earlier angle-sort prototype was rejected because it lost cells
+  on degenerate inputs.
+- **Spheroid geodesics:** add `ST_DistanceSpheroid`/related functions with a
+  Karney/Vincenty-quality implementation and reference fixtures; keep current
+  `*Sphere` functions explicit about spherical units/accuracy.
+- **Raster map algebra:** extend from `st_raster_info`/`st_raster_stats` to
+  clipping, rasterization, and band math behind a narrow GDAL boundary, with
+  deterministic small rasters in tests.
+
+### P4 — maintainability and release engineering
+
+- Keep dependency boundaries explicit: pure-Rust Sedona bridge, bundled/static
+  PROJ for transforms, dynamic GDAL for raster, and no accidental GEOS/SFCGAL
+  runtime requirement unless deliberately added.
+- Track binary size, load-time smoke, bridge overhead, and representative query
+  performance in `benchmarks/`.
+- Prefer small commits by phase: executor shape + registrations + SQL/Rust tests
+  + docs; avoid large mixed semantic changes.
+- Periodically regenerate the capability matrix from the registry to prevent docs
+  from drifting away from the SQL catalog.
