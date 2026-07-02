@@ -96,15 +96,15 @@ The extension already has a broad vector/geography/raster surface over WKB BLOBs
 DuckDB-chunk ⇄ Arrow bridge. 72 `sedona_st_*` functions are registered and
 runtime-verified, including CRS-tagged returns, CRS sidecar extractors,
 WKT/WKB typed constructors, Z/M point constructors, and constant-scalar argument
-detection. 32 public `st_*` functions already route to the literal SedonaDB
+detection. 36 public `st_*` functions already route to the literal SedonaDB
 kernel.
 
 Current verification baseline:
 
 - Rust unit tests: 64 pass.
-- SQL regressions: 191 pass / 0 fail.
+- SQL regressions: 213 pass / 0 fail.
 - Release smoke test: 7 backend checks pass (local, SedonaDB, aggregate, GEOS, spheroid, raster).
-- Catalog: 227 registered SQL functions (154 `st_*` public + 72 `sedona_st_*` bridge + 1 extension-specific).
+- Catalog: 231 registered SQL functions (158 `st_*` public + 72 `sedona_st_*` bridge + 1 extension-specific). Audit with `python3 tools/catalog_audit.py`.
 
 ## Capability matrix (category-level)
 
@@ -172,34 +172,30 @@ Planning rules:
   topology schema, Tiger/geocoder, SFCGAL solids, and a custom raster expression
   language.
 
-### Month 1 — compatibility contract and namespace polish
+### Month 1 — compatibility contract and namespace polish — ✅ LANDED
 
 Outcome: users can see exactly what is compatible, what is bridged, and what
 differs before they port SQL.
 
-1. **Generated catalog audit.** Add a small maintainer tool that reads
-   `src/registry.rs` and emits the registered SQL catalog grouped by provenance:
-   literal SedonaDB, local geo, GEOS, PROJ, GDAL/raster, aggregates, and table
-   functions. Use it to refresh README/ROADMAP counts.
-2. **PostGIS/SedonaDB compatibility table.** Publish a compact table for common
-   functions: supported, alias-only, semantic delta, DuckDB-native alternative,
+Landed:
+
+1. **Generated catalog audit.** `tools/catalog_audit.py` reads `src/registry.rs`
+   and emits the registered SQL catalog grouped by provenance: literal SedonaDB,
+   local geo, GEOS, PROJ, GDAL/raster, aggregates, and table functions. Run with
+   `python3 tools/catalog_audit.py [--markdown]`.
+2. **PostGIS/SedonaDB compatibility table.** `COMPATIBILITY.md` lists common
+   PostGIS functions and their status: supported, alias, semantic delta, not yet,
    or intentionally out of scope.
-3. **Namespace cleanup.** Add only low-risk PostGIS aliases/overloads that are
-   unambiguous in DuckDB and covered by SQL tests. Keep `st_*` the ergonomic
-   namespace and `sedona_st_*` the explicit literal provenance namespace.
-4. **Literal routing pass.** Re-inventory SedonaDB's
-   `default_function_set()` at the pinned rev and route additional public `st_*`
-   functions to the literal kernel where signatures and edge-case behavior match.
-5. **Reference fixtures expansion.** Add fixtures for empty/invalid geometry,
-   collections, antimeridian/antipodal geography, CRS round-trips, Voronoi/snap
-   degeneracies, nodata rasters, and Z/M constructor/accessor behavior.
-
-Exit gates:
-
-- Catalog counts are generated or reproducibly audited from `registry.rs`.
-- README and ROADMAP agree on function counts, backend ownership, and deltas.
-- Every new alias/routed function has a regression and, when applicable, a
-  `st_*` vs `sedona_st_*` fidelity check.
+3. **Namespace cleanup.** Added `ST_Force3D`/`3DZ`/`3DM`/`4D` routed to the
+   literal SedonaDB kernel (Z/M dimension forcing). Documented semantic delta:
+   explicit z/m parameter required (PostGIS defaults to 0).
+4. **Literal routing pass.** 36 public `st_*` functions now route to the literal
+   SedonaDB kernel (up from 32).
+5. **Reference fixtures expansion.** `tests/reference/month1_fixtures.sql` adds
+   22 checks: invalid geometry (bowtie), empty/NULL propagation, antimeridian
+   geography, CRS round-trip stability, GEOS snap degeneracy, Voronoi single
+   point, force-dimension family, large coordinates, nested collections, polygon
+   holes, degenerate lines.
 
 ### Month 2 — high-fidelity capability work
 

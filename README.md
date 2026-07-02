@@ -99,9 +99,11 @@ EWKT/EWKB/SRID, affine & segmentize transforms, line editing, GEOS topology,
 raster transform/statistics/pixel streaming, a set-returning `ST_Dump` family
 (`st_dump`/`st_dumppoints`/`st_dumpsegments`), and I/O.
 
-Current registry audit: **227 SQL functions** — 154 public `st_*`, 72 literal
+Current registry audit: **231 SQL functions** — 158 public `st_*`, 72 literal
 `sedona_st_*` bridge functions, and one extension-specific helper
-(`sedona_join`). 32 public `st_*` functions route to the literal SedonaDB kernel.
+(`sedona_join`). 36 public `st_*` functions route to the literal SedonaDB kernel.
+See **[COMPATIBILITY.md](./COMPATIBILITY.md)** for the full PostGIS/SedonaDB
+compatibility table. Run `python3 tools/catalog_audit.py` to regenerate counts.
 
 See **[ROADMAP.md](./ROADMAP.md)** for a category-level capability matrix vs
 SedonaDB and PostGIS and the current three-month plan. The literal SedonaDB

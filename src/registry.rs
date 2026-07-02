@@ -1348,5 +1348,15 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // (geom -> VARCHAR crs) — unary CRS extractor (ST_CRS / ST_SRID crs form).
     register_sedona_blob_crs!("sedona_st_crs_crs", "st_crs");
 
+    // --- Month 1: namespace cleanup — route public st_* to literal SedonaDB
+    // kernel for Z/M dimension forcing. The SedonaDB kernel handles Z/M WKB
+    // natively; the local stack is 2D-only. Semantic delta: PostGIS defaults
+    // z=0 and m=0 for these functions; here the default must be provided
+    // explicitly (SedonaDB requires it as a parameter). ---
+    register_sedona_blob_double_blob!("st_force3d", "st_force3d");
+    register_sedona_blob_double_blob!("st_force3dz", "st_force3d"); // PostGIS alias
+    register_sedona_blob_double_blob!("st_force3dm", "st_force3dm");
+    register_sedona_blob_double2_blob!("st_force4d", "st_force4d");
+
     Ok(())
 }
