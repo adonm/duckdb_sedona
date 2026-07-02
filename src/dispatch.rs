@@ -55,7 +55,7 @@ fn read_geom(col: &VectorReader, row: usize) -> Option<Geom> {
 
 /// Read the raw bytes at `row` of a BLOB column (validity-checked), without
 /// parsing. Used by the aggregate `update` callbacks, which need the raw WKB.
-fn read_blob(col: &VectorReader, row: usize) -> Option<&[u8]> {
+pub(crate) fn read_blob(col: &VectorReader, row: usize) -> Option<&[u8]> {
     // SAFETY: callers loop `row` over `col.row_count()`.
     if !unsafe { col.is_valid(row) } {
         return None;
@@ -136,7 +136,7 @@ where
 }
 
 /// Read an INTEGER at `row`, or `None` if NULL.
-fn read_i32(reader: &VectorReader, row: usize) -> Option<i32> {
+pub(crate) fn read_i32(reader: &VectorReader, row: usize) -> Option<i32> {
     if !unsafe { reader.is_valid(row) } {
         return None;
     }
@@ -144,7 +144,7 @@ fn read_i32(reader: &VectorReader, row: usize) -> Option<i32> {
 }
 
 /// Read a DOUBLE at `row`, or `None` if NULL.
-fn read_f64(reader: &VectorReader, row: usize) -> Option<f64> {
+pub(crate) fn read_f64(reader: &VectorReader, row: usize) -> Option<f64> {
     // SAFETY: `row` < row_count in all loops below.
     if !unsafe { reader.is_valid(row) } {
         return None;

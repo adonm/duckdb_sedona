@@ -578,14 +578,28 @@ pub fn end_point(g: &Geom) -> Option<Geom> {
 
 /// `ST_IsClosed(geom)`.
 pub fn is_closed(g: &Geom) -> Option<bool> {
-    Some(match g {
-        Geometry::LineString(ls) => ls.0.first().is_some_and(|f| ls.0.last().is_some_and(|l| f == l)),
-        Geometry::MultiLineString(mls) => mls.0.iter().all(|ls| {
-            ls.0.first().is_some_and(|f| ls.0.last().is_some_and(|l| f == l))
-        }),
-        Geometry::Polygon(_) | Geometry::MultiPolygon(_) => true,
-        _ => false,
-    })
+    // An empty geometry is not closed (matches SedonaDB / PostGIS).
+    if is_empty(g).unwrap_or(false) {
+        return Some(false);
+    }
+    Some(all_rings_closed(g))
+}
+
+/// Recursive helper: true iff every constituent LineString is closed (its
+/// endpoints coincide). A GeometryCollection is closed only if every child is.
+#[inline]
+fn all_rings_closed(g: &Geom) -> bool {
+    fn endpoints_match(ls: &geo_types::LineString<f64>) -> bool {
+        ls.0.first().is_some_and(|f| ls.0.last().is_some_and(|l| f == l))
+    }
+    match g {
+        // Polygons are always closed (rings); points/multipoints have no open
+        // boundary, so they are vacuously closed.
+        Geometry::LineString(ls) => endpoints_match(ls),
+        Geometry::MultiLineString(mls) => mls.0.iter().all(endpoints_match),
+        Geometry::GeometryCollection(c) => c.0.iter().all(all_rings_closed),
+        _ => true,
+    }
 }
 
 /// `ST_CoordDim(geom)` — this extension handles 2D WKB.
@@ -652,8 +666,13 @@ pub fn translate(g: &Geom, dx: f64, dy: f64) -> Option<Geom> {
 
 /// `ST_Scale(geom, xfac, yfac)`.
 pub fn scale(g: &Geom, xfac: f64, yfac: f64) -> Option<Geom> {
-    use geo::Scale;
-    Some(g.scale_xy(xfac, yfac))
+    use geo::Scale as _;
+    // PostGIS/SedonaDB ST_Scale multiplies coordinates by the factors about the
+    // ORIGIN (0,0). geo's `scale_xy` scales about the centroid instead, which
+    // would leave a single point unchanged — wrong vs the SQL standard. Scale
+    // about the origin explicitly. (Surfaced by tests/fidelity.sql vs
+    // sedona_st_scale.)
+    Some(g.scale_around_point(xfac, yfac, geo_types::Coord { x: 0.0, y: 0.0 }))
 }
 
 // ----- I/O ----------------------------------------------------------------

@@ -734,5 +734,340 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .register(con)?;
     }
 
+    // ---------------------------------------------------------------------
+    // Literal Apache SedonaDB bridge.
+    //
+    // The functions below register the REAL `sedona-functions` DataFusion
+    // scalar UDFs (linked from the apache/sedona-db workspace — see Cargo.toml
+    // for the pinned rev) under a `sedona_` prefix, side-by-side with the
+    // reimplemented functions above. Each line routes a DuckDB SQL name to a
+    // SedonaDB kernel through the DuckDB-chunk ⇄ Arrow bridge in
+    // `src/bridge.rs`. This makes the "SedonaDB superset" literal: the same
+    // code SedonaDB itself runs is invoked on DuckDB vectors.
+    //
+    // Extend by appending lines; the entire `default_function_set()` is
+    // reachable this way (only item-crs/struct-returning UDFs are omitted —
+    // the extension's type system is plain WKB BLOB, not SedonaDB item-crs).
+    // ---------------------------------------------------------------------
+    macro_rules! register_sedona_blob_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_int {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_to_int($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Integer)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_bool {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_to_bool($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Boolean)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_varchar {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_to_varchar($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Varchar)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_double {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_to_double($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Double)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_int_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_int_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Integer)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_doubles2_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::doubles2_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_double2_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_double2_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Double)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_blob_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_blob_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_blob_double {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_blob_to_double($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Double)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_int_crs {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_int_extract_crs($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Integer)
+                    .returns(TypeId::Varchar)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_varchar_crs {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::varchar_extract_crs($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Varchar)
+                    .returns(TypeId::Varchar)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_varchar_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::varchar_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Varchar)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_double_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_double_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Double)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+
+    // The literal batch — real SedonaDB kernels, one line each.
+    register_sedona_blob_blob!("sedona_st_envelope", "st_envelope");
+    register_sedona_blob_blob!("sedona_st_reverse", "st_reverse");
+    register_sedona_blob_blob!("sedona_st_flipcoordinates", "st_flipcoordinates");
+    register_sedona_blob_blob!("sedona_st_startpoint", "st_startpoint");
+    register_sedona_blob_int!("sedona_st_dimension", "st_dimension");
+    register_sedona_blob_int!("sedona_st_numpoints", "st_npoints");
+    register_sedona_blob_bool!("sedona_st_isempty", "st_isempty");
+    register_sedona_blob_bool!("sedona_st_isclosed", "st_isclosed");
+    register_sedona_blob_varchar!("sedona_st_astext", "st_astext");
+    register_sedona_blob_varchar!("sedona_st_geometrytype", "st_geometrytype");
+    register_sedona_varchar_blob!("sedona_st_geomfromewkt", "st_geomfromewkt");
+    register_sedona_blob_double_blob!("sedona_st_segmentize", "st_segmentize");
+
+    // --- Expanded literal batch: ordinate accessors, predicates, accessors ---
+    // (geom -> DOUBLE) — bbox/ordinate accessors (the prefilter-join surface)
+    register_sedona_blob_double!("sedona_st_x", "st_x");
+    register_sedona_blob_double!("sedona_st_y", "st_y");
+    register_sedona_blob_double!("sedona_st_z", "st_z");
+    register_sedona_blob_double!("sedona_st_m", "st_m");
+    register_sedona_blob_double!("sedona_st_xmin", "st_xmin");
+    register_sedona_blob_double!("sedona_st_xmax", "st_xmax");
+    register_sedona_blob_double!("sedona_st_ymin", "st_ymin");
+    register_sedona_blob_double!("sedona_st_ymax", "st_ymax");
+    register_sedona_blob_double!("sedona_st_zmin", "st_zmin");
+    register_sedona_blob_double!("sedona_st_zmax", "st_zmax");
+    register_sedona_blob_double!("sedona_st_mmin", "st_mmin");
+    register_sedona_blob_double!("sedona_st_mmax", "st_mmax");
+    // (geom -> BOOLEAN)
+    register_sedona_blob_bool!("sedona_st_iscollection", "st_iscollection");
+    register_sedona_blob_bool!("sedona_st_hasz", "st_hasz");
+    register_sedona_blob_bool!("sedona_st_hasm", "st_hasm");
+    // (geom -> INTEGER)
+    register_sedona_blob_int!("sedona_st_numgeometries", "st_numgeometries");
+    // (geom -> geom)
+    register_sedona_blob_blob!("sedona_st_force2d", "st_force2d");
+    register_sedona_blob_blob!("sedona_st_points", "st_points");
+    register_sedona_blob_blob!("sedona_st_endpoint", "st_endpoint");
+    // (geom, INTEGER -> geom) — indexed accessors
+    register_sedona_blob_int_blob!("sedona_st_geometryn", "st_geometryn");
+    register_sedona_blob_int_blob!("sedona_st_pointn", "st_pointn");
+    register_sedona_blob_int_blob!("sedona_st_interiorringn", "st_interiorringn");
+    register_sedona_blob_int_blob!("sedona_st_setsrid", "st_setsrid");
+
+    // --- Phase D: CRS sidecar access (item-crs struct → VARCHAR crs column) ---
+    // sedona_st_geomfromewkt returns plain WKB (item); sedona_st_geomfromewkt_crs
+    // extracts the CRS string SedonaDB parsed from the EWKT `SRID=...;` prefix,
+    // so callers can read item-crs metadata without a DuckDB struct type model.
+    // (st_setsrid sets the SRID at the type level and returns plain WKB, so it
+    // has no extractable crs column — geomfromewkt is the CRS-bearing path.)
+    register_sedona_varchar_crs!("sedona_st_geomfromewkt_crs", "st_geomfromewkt");
+
+    // --- Phase C expanded batch: constructors, transforms, measurements ---
+    // (DOUBLE, DOUBLE) -> geom
+    register_sedona_doubles2_blob!("sedona_st_point", "st_point");
+    register_sedona_doubles2_blob!("sedona_st_geogpoint", "st_geogpoint");
+    // (geom, DOUBLE, DOUBLE) -> geom
+    register_sedona_blob_double2_blob!("sedona_st_translate", "st_translate");
+    register_sedona_blob_double2_blob!("sedona_st_scale", "st_scale");
+    register_sedona_blob_double2_blob!("sedona_st_linesubstring", "st_linesubstring");
+    // (geom, geom) -> geom
+    register_sedona_blob_blob_blob!("sedona_st_makeline", "st_makeline");
+    // (geom, geom) -> DOUBLE
+    register_sedona_blob_blob_double!("sedona_st_azimuth", "st_azimuth");
+    // (geom) -> BLOB (WKB serialization) / INTEGER (zm flag)
+    register_sedona_blob_blob!("sedona_st_asbinary", "st_asbinary");
+    register_sedona_blob_blob!("sedona_st_asewkb", "st_asewkb");
+    register_sedona_blob_int!("sedona_st_zmflag", "st_zmflag");
+    // (geom, DOUBLE) -> geom — numeric-tolerant rotates
+    register_sedona_blob_double_blob!("sedona_st_rotate", "st_rotate");
+    register_sedona_blob_double_blob!("sedona_st_rotate_x", "st_rotate_x");
+    register_sedona_blob_double_blob!("sedona_st_rotate_y", "st_rotate_y");
+
     Ok(())
 }

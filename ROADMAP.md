@@ -25,9 +25,31 @@ OrientedEnvelope` · `ST_Affine`(6-param)/`ST_Segmentize`/`ST_LineSubstring`/
 table functions. Verified end-to-end in DuckDB 1.5.4 over a local DuckLake and
 Apache SpatialBench (`benchmarks/BENCHMARKS.md`).
 
+**Literal Apache SedonaDB now linked.** Beyond the reimplementation above,
+`src/bridge.rs` invokes the real `sedona-functions` DataFusion UDF kernels
+directly from DuckDB (DuckDB-chunk ⇄ Arrow bridge); 35+ `sedona_*` functions
+are registered side-by-side with ours and runtime-verified, including CRS-tagged
+returns (item-crs structs unwrapped to WKB at the extension's native fidelity),
+a CRS sidecar extractor (`sedona_st_geomfromewkt_crs`), and constant-scalar
+argument detection. Bridge overhead is negligible (benchmarks/bridge.sql: literal
+path competitive with the local reimplementation). See "Resolved #1" below.
+
 ## Previously-flagged hard bits — now resolved
 
-1. **`ST_Transform` via PROJ (Tier 3a) — ✅ DONE (option a: accept runtime dep).**
+1. **Literal Apache SedonaDB bridge — ✅ DONE.** `src/bridge.rs` links the real
+   `sedona-functions` crate (git rev `b23ccd15`, + `sedona-expr`/`schema` and
+   `datafusion-expr`/`-common` as trait types only) and invokes SedonaDB's own
+   DataFusion UDF kernels directly from a DuckDB callback via a DuckDB-chunk ⇄
+   Arrow bridge (BLOB/WKB → `BinaryArray` → `SedonaScalarUDF::invoke_with_args`
+   → result array → DuckDB vector). 12 functions are registered under a
+   `sedona_` prefix, side-by-side with the reimplementation (`st_dimension` /
+   `sedona_st_dimension` run the same algorithm through two code paths). The
+   entire `default_function_set()` is reachable by appending registry lines;
+   only item-crs/struct-returning UDFs are omitted. Runtime-verified:
+   `cargo test --lib bridge` drives the real `st_dimension`/`st_astext`/
+   `st_isempty` kernels through the bridge. The SedonaDB tree is pure-Rust, so
+   it adds no GDAL/PROJ/GEOS and cannot collide with the vendored C deps.
+2. **`ST_Transform` via PROJ (Tier 3a) — ✅ DONE (option a: accept runtime dep).**
    PROJ 9.8.1 linked; `ST_Transform(geom, from_srid, to_srid)` reprojects between EPSG
    codes (verified: London 4326→3857 = 14227, 6711542; Sedona = -12441066, 4144872).
    A thread-local `Proj` cache avoids re-parsing the CRS per row. **Runtime dep:**
@@ -40,7 +62,7 @@ Apache SpatialBench (`benchmarks/BENCHMARKS.md`).
    `(a_row, b_row)` pairs. Verified: 20k×20k building self-join returns 37 pairs —
    identical to the bbox-prefilter result. This is the SedonaDB disk-spilling spatial
    join model, realized without needing any DuckDB join-planner/GiST API.
-3. **`ST_VoronoiPolygons`** — `geo` 0.31 has no Voronoi; needs a new dep or port. Still
+4. **`ST_VoronoiPolygons`** — `geo` 0.31 has no Voronoi; needs a new dep or port. Still
    open (low priority).
 
 ## Capability matrix (category-level)

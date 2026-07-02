@@ -58,8 +58,27 @@ rstar = "0.13"
 proj = { version = "0.31", features = ["bundled_proj"] }
 libsqlite3-sys = { version = ">=0.28,<0.36", features = ["bundled"] }
 arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
 parquet = "57"
 gdal = { version = "0.19", features = ["bindgen"] }
+
+# The *literal* SedonaDB superset. We link the real `sedona-functions` crate —
+# its `default_function_set()` of DataFusion scalar UDFs — and bridge DuckDB
+# chunks ⇄ Arrow (see `src/bridge.rs`) so DuckDB invokes SedonaDB's own kernels
+# directly instead of our reimplementation. The git rev pins the whole
+# `sedona-db` workspace; the transitive internal crates (sedona-expr,
+# sedona-schema, sedona-common, sedona-geometry, sedona-raster) resolve from the
+# same rev automatically. The tree is pure-Rust (no GDAL/PROJ/GEOS dragged in),
+# so it cannot collide with the vendored GDAL/PROJ above. datafusion-* is pulled
+# only as expression/common traits (no executor), and arrow 57.x already matches.
+sedona-functions = { git = "https://github.com/apache/sedona-db", rev = "b23ccd15f649487b043be219b2dfbb6bad7a668d" }
+# Direct deps so `src/bridge.rs` can `use sedona_expr::` / `use sedona_schema::`
+# (Rust requires direct deps for `use` paths). Same git rev; no extra fetch.
+sedona-expr = { git = "https://github.com/apache/sedona-db", rev = "b23ccd15f649487b043be219b2dfbb6bad7a668d" }
+sedona-schema = { git = "https://github.com/apache/sedona-db", rev = "b23ccd15f649487b043be219b2dfbb6bad7a668d" }
+datafusion-common = "52.5"
+datafusion-expr = "52.5"
 
 # Vendored + patched crates. We vendor when an upstream crate lags the C-API we
 # target OR has a correctness bug on the hot path that we need to fix at source

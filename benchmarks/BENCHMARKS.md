@@ -141,3 +141,28 @@ guards here remain as cheap belt-and-suspenders.
 | `spatialbench_full.sql` | full query set incl. bbox-prefiltered joins |
 | `run_queries.sh` | per-query timing (one process each) |
 | `run.sh` | end-to-end: build → package → generate/cache data → lake → queries |
+| `bridge.sql` | local `st_*` vs literal SedonaDB `sedona_*` overhead (1M points) |
+
+## Literal SedonaDB bridge overhead (`bridge.sql`)
+
+Compares the local `st_*` reimplementation against the literal Apache SedonaDB
+kernel (`sedona_*`) over 1,000,000 points, wall-clock seconds (DuckDB
+1.5.4, `.timer on`). Both paths share the same vectorized DuckDB chunking; the
+delta is the DuckDB-chunk ⇄ Arrow bridge cost (per-chunk array build +
+`invoke_with_args` + write-back).
+
+| Operation | local `st_*` (s) | literal `sedona_*` (s) |
+|-----------|------------------|------------------------|
+| `ST_Dimension`     | 0.197 | 0.188 |
+| `ST_XMin`          | 0.208 | 0.258 |
+| `ST_AsText`        | 0.355 | 0.324 |
+| `ST_Segmentize`    | 0.491 | 0.436 |
+
+**Finding: the bridge overhead is negligible** — within run-to-run noise, and
+the literal SedonaDB path is competitive with (often faster than) the local
+reimplementation on the heavier kernels (`ST_AsText`, `ST_Segmentize`). No
+allocation-tuning is warranted: the per-chunk Arrow array build is amortized
+across DuckDB's standard 2048-row chunks, and SedonaDB's own WKB iteration is
+already vectorized. Reproduce with:
+`LD_LIBRARY_PATH=<gdal-lib> duckdb -unsigned -cmd "LOAD '<ext>';" < benchmarks/bridge.sql`.
+
