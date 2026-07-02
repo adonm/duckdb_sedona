@@ -119,4 +119,15 @@ SELECT CASE WHEN st_astext(st_makeline_agg(g ORDER BY k)) = 'LINESTRING(0 0,1 1,
 SELECT CASE WHEN st_astext(st_snap(st_geomfromtext('POINT(0.001 0)'), st_geomfromtext('POINT(0 0)'), 0.01)) = 'POINT(0 0)' THEN 'PASS' ELSE 'FAIL snap' END;
 SELECT CASE WHEN st_numgeometries(st_subdivide(st_geomfromtext('LINESTRING(0 0,1 1,2 2,3 3,4 4,5 5)'),2)) >= 2 THEN 'PASS' ELSE 'FAIL subdivide' END;
 SELECT CASE WHEN st_geometrytype(st_node(st_geomfromtext('MULTILINESTRING((0 0,2 2),(2 0,0 2))'))) = 'ST_MultiLineString' THEN 'PASS' ELSE 'FAIL node' END;
+-- GEOS-backed topology (Phase 2): PostGIS-grade planar operations
+SELECT CASE WHEN st_numgeometries(st_node(st_geomfromtext('MULTILINESTRING((0 0,4 4),(0 4,4 0))'))) = 4 THEN 'PASS' ELSE 'FAIL geos-node-crossing' END;
+SELECT CASE WHEN st_numgeometries(st_polygonize(st_geomfromtext('LINESTRING(0 0,4 0,4 4,0 4,0 0)'))) = 1 THEN 'PASS' ELSE 'FAIL geos-polygonize' END;
+SELECT CASE WHEN abs(st_area(st_buildarea(st_geomfromtext('MULTILINESTRING((0 0,4 0,4 4,0 4,0 0),(1 1,2 1,2 2,1 2,1 1))'))) - 15.0) < 1e-6 THEN 'PASS' ELSE 'FAIL geos-buildarea' END;
+-- The 3x3 Voronoi grid that defeated the earlier angle-sort prototype (now GEOS)
+SELECT CASE WHEN st_numgeometries(st_voronoipolygons(st_geomfromtext('MULTIPOINT((0 0),(1 0),(2 0),(0 1),(1 1),(2 1),(0 2),(1 2),(2 2))'))) = 9 THEN 'PASS' ELSE 'FAIL geos-voronoi-grid' END;
+-- Spheroid geodesics (Karney / GeographicLib, WGS84)
+SELECT CASE WHEN abs(st_distancespheroid(st_point(-0.1278, 51.5074), st_point(2.3522, 48.8566)) - 343924.0) < 50.0 THEN 'PASS' ELSE 'FAIL spheroid-distance' END;
+SELECT CASE WHEN abs(st_lengthspheroid(st_geomfromtext('LINESTRING(0 0,1 0)')) - 111319.0) < 1.0 THEN 'PASS' ELSE 'FAIL spheroid-length' END;
+SELECT CASE WHEN st_areaspheroid(st_geomfromtext('POLYGON((0 0,1 0,1 1,0 1,0 0))')) > 1.2e10 THEN 'PASS' ELSE 'FAIL spheroid-area' END;
+SELECT CASE WHEN st_dwithinspheroid(st_point(-0.1278, 51.5074), st_point(2.3522, 48.8566), 400000.0) = true THEN 'PASS' ELSE 'FAIL spheroid-dwithin' END;
 SELECT CASE WHEN st_area(st_intersection_agg(g)) = 4.0 THEN 'PASS' ELSE 'FAIL intersection_agg' FROM (SELECT st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))') g UNION ALL SELECT st_geomfromtext('POLYGON((0 0,4 0,4 4,0 4,0 0))'));

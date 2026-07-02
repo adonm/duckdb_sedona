@@ -122,3 +122,7 @@ SELECT CASE WHEN sedona_st_zmflag(sedona_st_force4d(st_geomfromtext('POINT(1 2)'
 SELECT CASE WHEN sedona_st_astext(sedona_st_pointz(1, 2, 3)) = 'POINT Z(1 2 3)' THEN 'PASS' ELSE 'FAIL sedona pointz' END;
 SELECT CASE WHEN sedona_st_astext(sedona_st_pointm(1, 2, 3)) = 'POINT M(1 2 3)' THEN 'PASS' ELSE 'FAIL sedona pointm' END;
 SELECT CASE WHEN sedona_st_astext(sedona_st_pointzm(1, 2, 3, 4)) = 'POINT ZM(1 2 3 4)' THEN 'PASS' ELSE 'FAIL sedona pointzm' END;
+
+-- === Phase 1 cleanup: ST_Affine 2D (geom + 6 doubles) ===
+-- a=2,b=0,d=0,e=3,xOff=1,yOff=1 on POINT(1,1) -> (2*1+0*1+1, 0*1+3*1+1) = (3,4)
+SELECT CASE WHEN st_astext(sedona_st_affine(st_geomfromtext('POINT(1 1)'), 2,0,0,3,1,1)) = 'POINT(3 4)' THEN 'PASS' ELSE 'FAIL sedona affine' END;

@@ -296,7 +296,7 @@ pub fn geom_from_text(s: &str) -> Option<Geom> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn geom_from_wkt(parsed: wkt::Wkt<f64>) -> Option<Geom> {
+pub(crate) fn geom_from_wkt(parsed: wkt::Wkt<f64>) -> Option<Geom> {
     use std::convert::TryInto;
     // Prefer the explicit TryFrom<Wkt> for Geometry when available; fall back
     // to the inherent `to_geometry` accessor used by upstream SedonaDB.
@@ -1132,6 +1132,93 @@ pub fn area_sphere(g: &Geom) -> Option<f64> {
         Geometry::MultiPolygon(mp) => mp.chamberlain_duquette_unsigned_area(),
         _ => 0.0,
     })
+}
+
+// ----- Geography (spheroid) variants ---------------------------------------
+// Coordinates interpreted as lon/lat (x=lon, y=lat). Uses Karney's algorithm
+// (GeographicLib) on the WGS84 ellipsoid — converges everywhere, including
+// antipodal points where Vincenty fails. Distances in metres, area in m².
+
+/// `ST_DistanceSpheroid(a, b)` — geodesic distance on the WGS84 ellipsoid
+/// (metres). Higher accuracy than the spherical `ST_DistanceSphere`.
+pub fn distance_spheroid(a: &Geom, b: &Geom) -> Option<f64> {
+    use geographiclib_rs::{Geodesic, InverseGeodesic};
+    let ca = point_coord(a)?;
+    let cb = point_coord(b)?;
+    let g = Geodesic::wgs84();
+    // geographiclib takes (lat, lon); our coords are (x=lon, y=lat).
+    let d: f64 = g.inverse(ca.y, ca.x, cb.y, cb.x);
+    Some(d)
+}
+
+/// `ST_DWithinSpheroid(a, b, metres)`.
+pub fn dwithin_spheroid(a: &Geom, b: &Geom, metres: f64) -> Option<bool> {
+    Some(distance_spheroid(a, b)? <= metres)
+}
+
+/// `ST_LengthSpheroid(geom)` — geodesic length of a (multi)linestring on WGS84
+/// (metres).
+pub fn length_spheroid(g: &Geom) -> Option<f64> {
+    use geographiclib_rs::{Geodesic, InverseGeodesic};
+    let geo = Geodesic::wgs84();
+    let mut total = 0.0_f64;
+    for line in lines_of(g) {
+        let mut prev: Option<(f64, f64)> = None; // (lon, lat)
+        for c in line.coords() {
+            let cur = (c.x, c.y);
+            if let Some((lon1, lat1)) = prev {
+                let d: f64 = geo.inverse(lat1, lon1, cur.1, cur.0);
+                total += d;
+            }
+            prev = Some(cur);
+        }
+    }
+    Some(total)
+}
+
+/// `ST_AreaSpheroid(geom)` — geodesic area on the WGS84 ellipsoid (m²).
+pub fn area_spheroid(g: &Geom) -> Option<f64> {
+    use geographiclib_rs::{Geodesic, PolygonArea, Winding};
+    let geo = Geodesic::wgs84();
+    let mut total = 0.0_f64;
+    for poly in polygons_of(g) {
+        let (outer_perimeter, outer_area) = {
+            let mut pa = PolygonArea::new(&geo, Winding::CounterClockwise);
+            for c in poly.exterior().coords() {
+                pa.add_point(c.y, c.x); // (lat, lon)
+            }
+            let (perimeter, area, _) = pa.compute(true);
+            (perimeter, area)
+        };
+        total += outer_area.abs();
+        for interior in poly.interiors() {
+            let mut pa = PolygonArea::new(&geo, Winding::Clockwise);
+            for c in interior.coords() {
+                pa.add_point(c.y, c.x);
+            }
+            let (_perimeter, area, _) = pa.compute(true);
+            total -= area.abs();
+        }
+    }
+    Some(total)
+}
+
+/// Collect all line strings from a geometry (for spheroid length).
+fn lines_of(g: &Geom) -> Vec<&geo_types::LineString> {
+    match g {
+        Geometry::LineString(ls) => vec![ls],
+        Geometry::MultiLineString(mls) => mls.0.iter().collect(),
+        _ => vec![],
+    }
+}
+
+/// Collect all polygons from a geometry (for spheroid area).
+fn polygons_of(g: &Geom) -> Vec<&geo_types::Polygon> {
+    match g {
+        Geometry::Polygon(p) => vec![p],
+        Geometry::MultiPolygon(mp) => mp.0.iter().collect(),
+        _ => vec![],
+    }
 }
 
 // ----- CRS reprojection via PROJ (Tier 3a) ------------------------------

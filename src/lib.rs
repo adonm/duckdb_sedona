@@ -41,6 +41,7 @@ pub mod dispatch;
 #[allow(clippy::needless_borrow)]
 pub mod functions;
 pub mod geometry;
+pub mod geos_backend;
 pub mod raster;
 pub mod registry;
 pub mod spatial_join;

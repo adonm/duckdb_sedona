@@ -141,7 +141,7 @@ Legend: ✅ shipped · 🟡 partial · ⏳ not yet · ➖ out of scope (niche).
 | **Geography (geodesic) ops** | ✅ | ✅ | ✅ | `Distance/DWithin/Length/Area` Sphere done (lon/lat) |
 | **CRS / PROJ (`ST_Transform`, SRID)** | ✅ | ✅ | ✅ | `ST_Transform` via PROJ (runtime libproj dep) |
 | **Spatial index join (R-tree/GiST, `&&`/`<->`)** | ✅ | ✅ | ✅ | `sedona_join` table fn (R-tree over spilled parquet) + bbox-prefilter |
-| **Raster / map algebra** | ✅ (PostGIS Raster) | ✅ (`sedona-raster`) | ✅ (core) — `st_raster_info` + `st_raster_stats` via vendored+patched GDAL against libgdal 3.13; full map-algebra pending |
+| **Raster / map algebra** | ✅ (PostGIS Raster) | ✅ (`sedona-raster`) | ✅ — `st_raster_info` + `st_raster_stats` + `st_pixeldata` (pixel streaming → DuckDB-native SQL map algebra) via vendored+patched GDAL against libgdal 3.13; full `ST_MapAlgebra` expression engine is unnecessary (SQL IS the algebra) |
 | **3D / Z-M geometry + SFCGAL surfaces** | ✅ (SFCGAL) | ⏳ | ⏳ No mature Rust SFCGAL bindings (see Tier 4) |
 | Topology / Tiger geocoder / address standardizer | ✅ | ➖ | ➖ | niche; not in SedonaDB either |
 
@@ -276,7 +276,22 @@ The target is higher value and more focused:
   sidecar).
 - Alias/arity alignment is ongoing as new functions land.
 
-### P3 — hard capability gaps, only with correct algorithms — ⏳ DEFERRED
+### P3 — hard capability gaps, only with correct algorithms — ✅ LANDED
+
+- **Topology editing:** `ST_Node` (GEOS), `ST_Polygonize` (GEOS),
+  `ST_BuildArea` (GEOS) — PostGIS-grade planar topology via a narrow
+  `src/geos_backend.rs` boundary (WKB → GEOS → WKB, no geo_types round-trip).
+- **Bounded Voronoi polygons:** `ST_VoronoiPolygons` (GEOS). The 3×3 cocircular
+  grid that defeated the earlier angle-sort prototype now yields exactly 9 cells.
+- **Spheroid geodesics:** `ST_DistanceSpheroid`, `ST_LengthSpheroid`,
+  `ST_AreaSpheroid`, `ST_DWithinSpheroid` via GeographicLib (Karney's algorithm)
+  on the WGS84 ellipsoid — converges everywhere including antipodal points.
+- **Raster map algebra:** `ST_PixelData(path, band)` streams band pixels as
+  (row, col, value) rows; map algebra is then DuckDB-native SQL (WHERE/CASE/
+  arithmetic). No custom expression parser — the narrow GDAL boundary stays at
+  one band read → DuckDB rows.
+- Still open: `ST_Snap` (needs GEOS snap, lower priority), `ST_AsRaster`
+  (rasterize a geometry), custom-spheroid parameter for `*Spheroid` functions.
 
 - **Topology editing:** `ST_Node`, `ST_Snap`, `ST_Polygonize`, `ST_BuildArea`.
   These need robust graph/topology code and should land with adversarial fixtures,

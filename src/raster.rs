@@ -6,6 +6,11 @@
 //!     nodata, GeoTransform origin/pixel size).
 //!   * `st_raster_stats(path, band)` — ST_SummaryStats: min/max/mean/std/count
 //!     over a band's non-nodata pixels (read as its native GDAL type).
+//!   * `st_pixeldata(path, band)` — stream all pixels of a band as (row, col,
+//!     value) rows. This is the foundation for map algebra: users apply SQL
+//!     expressions (WHERE, CASE, arithmetic) directly on the pixel table rather
+//!     than through a custom expression parser. The GDAL boundary stays narrow
+//!     (one band read → DuckDB rows); the algebra is DuckDB-native SQL.
 
 use gdal::raster::GdalDataType;
 use gdal::Dataset;
@@ -176,4 +181,79 @@ pub unsafe extern "C" fn raster_stats_scan(info: duckdb_function_info, output: d
     unsafe { c4.write_i64(0, count) };
     unsafe { chunk.set_size(1) };
     drop((c0, c1, c2, c3, c4));
+}
+
+// ===== st_pixeldata(path, band) ==========================================
+// Streams all pixels of a band as (row, col, value) rows. Nodata pixels are
+// emitted as NULL (so SQL predicates naturally skip them). Map algebra is then
+// DuckDB-native SQL, e.g.:
+//   SELECT avg(value) FROM st_pixeldata('r.tif', 1) WHERE value > 100;
+//   SELECT row, col, CASE WHEN value > 50 THEN 1 ELSE 0 END FROM st_pixeldata(...);
+
+fn read_band_pixels(path: &str, band_no: usize) -> Result<(Vec<Option<f64>>, usize, usize), String> {
+    let ds = Dataset::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    let band = ds.rasterband(band_no).map_err(|e| format!("band {band_no}: {e}"))?;
+    let (w, h) = band.size();
+    let nodata = band.no_data_value();
+    let to_opts = |v: f64| if !v.is_finite() || matches!(nodata, Some(nd) if nd == v) { None } else { Some(v) };
+    let pixels: Vec<Option<f64>> = match band.band_type() {
+        GdalDataType::UInt8 => band.read_band_as::<u8>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::Int16 => band.read_band_as::<i16>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::UInt16 => band.read_band_as::<u16>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::Int32 => band.read_band_as::<i32>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::UInt32 => band.read_band_as::<u32>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::Float32 => band.read_band_as::<f32>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v as f64)).collect(),
+        GdalDataType::Float64 => band.read_band_as::<f64>().map_err(|e| e.to_string())?.data().iter().map(|&v| to_opts(v)).collect(),
+        other => return Err(format!("unsupported GDAL dtype: {other:?}")),
+    };
+    Ok((pixels, w, h))
+}
+
+pub struct PixelDataBind { pixels: Vec<Option<f64>>, width: usize }
+pub struct PixelDataScan { cursor: usize }
+
+pub unsafe extern "C" fn pixeldata_bind(info: duckdb_bind_info) {
+    let bi = unsafe { BindInfo::new(info) };
+    let path = unsafe { bi.get_parameter_value(0) }.as_str().unwrap_or_default();
+    let band_no = unsafe { bi.get_parameter_value(1) }.as_i32().max(1) as usize;
+    let (pixels, width, _height) = match read_band_pixels(&path, band_no) {
+        Ok(r) => r,
+        Err(e) => { bi.set_error(&e); return; }
+    };
+    bi.add_result_column("row", TypeId::Integer)
+        .add_result_column("col", TypeId::Integer)
+        .add_result_column("value", TypeId::Double)
+        .set_cardinality(pixels.len() as u64, true);
+    unsafe { FfiBindData::<PixelDataBind>::set(info, PixelDataBind { pixels, width }) };
+}
+
+pub unsafe extern "C" fn pixeldata_init(info: duckdb_init_info) {
+    unsafe { InitInfo::new(info).set_max_threads(1) };
+    unsafe { FfiInitData::<PixelDataScan>::set(info, PixelDataScan { cursor: 0 }) };
+}
+
+pub unsafe extern "C" fn pixeldata_scan(info: duckdb_function_info, output: duckdb_data_chunk) {
+    let chunk = unsafe { DataChunk::from_raw(output) };
+    let cap = unsafe { duckdb_vector_size() } as usize;
+    let Some(data) = (unsafe { FfiBindData::<PixelDataBind>::get_from_function(info) }) else { unsafe { chunk.set_size(0) }; return; };
+    let Some(state) = (unsafe { FfiInitData::<PixelDataScan>::get_mut(info) }) else { unsafe { chunk.set_size(0) }; return; };
+    let batch = data.pixels.len().saturating_sub(state.cursor).min(cap);
+    if batch == 0 { unsafe { chunk.set_size(0) }; return; }
+    let mut c0 = unsafe { chunk.writer(0) };
+    let mut c1 = unsafe { chunk.writer(1) };
+    let mut c2 = unsafe { chunk.writer(2) };
+    for i in 0..batch {
+        let idx = state.cursor + i;
+        let row = (idx / data.width) as i32;
+        let col = (idx % data.width) as i32;
+        unsafe { c0.write_i32(i, row) };
+        unsafe { c1.write_i32(i, col) };
+        match data.pixels[idx] {
+            Some(v) => unsafe { c2.write_f64(i, v) },
+            None => unsafe { c2.set_null(i) },
+        }
+    }
+    state.cursor += batch;
+    unsafe { chunk.set_size(batch) };
+    drop((c0, c1, c2));
 }

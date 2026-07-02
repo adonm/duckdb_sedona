@@ -440,6 +440,58 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     register_binary_geom!("st_symdifference", functions::sym_difference);
     register_binary_geom!("st_makeline", functions::make_line);
 
+    // --- GEOS-backed planar topology (PostGIS-grade fidelity) ---------------
+    // These operate at the raw-WKB level (no geo_types round-trip) via a narrow
+    // boundary in src/geos_backend.rs. Each fails closed to NULL on GEOS errors.
+    {
+        unsafe extern "C" fn st_node_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) { dispatch::unary_wkb(input, output, crate::geos_backend::node); }
+        unsafe {
+            ScalarFunctionBuilder::new("st_node")
+                .param(TypeId::Blob).returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_node_cb).register(con)?;
+        }
+    }
+    {
+        unsafe extern "C" fn st_polygonize_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) { dispatch::unary_wkb(input, output, crate::geos_backend::polygonize); }
+        unsafe {
+            ScalarFunctionBuilder::new("st_polygonize")
+                .param(TypeId::Blob).returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_polygonize_cb).register(con)?;
+        }
+    }
+    {
+        unsafe extern "C" fn st_buildarea_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) { dispatch::unary_wkb(input, output, crate::geos_backend::build_area); }
+        unsafe {
+            ScalarFunctionBuilder::new("st_buildarea")
+                .param(TypeId::Blob).returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_buildarea_cb).register(con)?;
+        }
+    }
+    {
+        unsafe extern "C" fn st_voronoipolygons_cb(
+            _: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+        ) {
+            dispatch::unary_wkb(input, output, |wkb| {
+                crate::geos_backend::voronoi_polygons(wkb, 0.0, None)
+            });
+        }
+        unsafe {
+            ScalarFunctionBuilder::new("st_voronoipolygons")
+                .param(TypeId::Blob).returns(TypeId::Blob)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(st_voronoipolygons_cb).register(con)?;
+        }
+    }
+
     register_predicate!("st_intersects", functions::intersects);
     register_predicate!("st_contains", functions::contains);
     register_predicate!("st_within", functions::within);
@@ -498,7 +550,7 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // --- Tier 1 remaining: ST_Snap, ST_Subdivide, ST_Node ------------------
     register_geom_geom_double_to_geom!("st_snap", functions::snap);
     register_geom_int_to_geom!("st_subdivide", functions::subdivide);
-    register_unary_geom!("st_node", functions::node);
+    // st_node is now GEOS-backed (canonical PostGIS-grade topology, line ~451).
 
     // --- Tier 1/1b parity batch: editing, transforms, measurements ---------
     register_geom_double6_to_geom!("st_affine", functions::affine);
@@ -589,6 +641,25 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
                 .returns(TypeId::Boolean)
                 .null_handling(NullHandling::SpecialNullHandling)
                 .function(cb).register(con)?;
+        }
+    }
+
+    // --- Spheroid geodesics (Karney / GeographicLib, WGS84 ellipsoid) -------
+    // Higher accuracy than the sphere variants; converges everywhere including
+    // antipodal points. Distances in metres, area in m².
+    register_binary_double!("st_distancespheroid", functions::distance_spheroid);
+    register_geom_double!("st_lengthspheroid", functions::length_spheroid);
+    register_geom_double!("st_areaspheroid", functions::area_spheroid);
+    {
+        unsafe extern "C" fn cb2(_i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector) {
+            dispatch::geom_geom_double_bool(input, output, functions::dwithin_spheroid);
+        }
+        unsafe {
+            ScalarFunctionBuilder::new("st_dwithinspheroid")
+                .param(TypeId::Blob).param(TypeId::Blob).param(TypeId::Double)
+                .returns(TypeId::Boolean)
+                .null_handling(NullHandling::SpecialNullHandling)
+                .function(cb2).register(con)?;
         }
     }
 
@@ -697,6 +768,13 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             .bind(crate::raster::raster_stats_bind)
             .init(crate::raster::raster_stats_init)
             .scan(crate::raster::raster_stats_scan)
+            .register(con)?;
+        TableFunctionBuilder::new("st_pixeldata")
+            .param(TypeId::Varchar)
+            .param(TypeId::Integer)
+            .bind(crate::raster::pixeldata_bind)
+            .init(crate::raster::pixeldata_init)
+            .scan(crate::raster::pixeldata_scan)
             .register(con)?;
     }
 
@@ -868,6 +946,42 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
             unsafe {
                 ScalarFunctionBuilder::new($sql_name)
                     .param(TypeId::Blob)
+                    .returns(TypeId::Blob)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_crs {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::unary_blob_extract_crs($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .returns(TypeId::Varchar)
+                    .null_handling(NullHandling::SpecialNullHandling)
+                    .function(cb)
+                    .register(con)?;
+            }
+        }};
+    }
+    macro_rules! register_sedona_blob_double6_blob {
+        ($sql_name:expr, $sedona_name:expr) => {{
+            unsafe extern "C" fn cb(
+                _i: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector,
+            ) {
+                crate::bridge::blob_double6_to_blob($sedona_name, input, output);
+            }
+            unsafe {
+                ScalarFunctionBuilder::new($sql_name)
+                    .param(TypeId::Blob)
+                    .param(TypeId::Double).param(TypeId::Double).param(TypeId::Double)
+                    .param(TypeId::Double).param(TypeId::Double).param(TypeId::Double)
                     .returns(TypeId::Blob)
                     .null_handling(NullHandling::SpecialNullHandling)
                     .function(cb)
@@ -1178,6 +1292,10 @@ pub(crate) fn register_all(con: duckdb_connection) -> Result<(), ExtensionError>
     // (geom -> geom) — bounding rectangle (compared by area in fidelity.sql;
     // ring winding may legitimately differ CCW/CW).
     register_sedona_blob_blob!("st_envelope", "st_envelope");
+    // (geom, DOUBLE×6) -> geom — ST_Affine 2D (a,b,d,e,xOff,yOff).
+    register_sedona_blob_double6_blob!("sedona_st_affine", "st_affine");
+    // (geom -> VARCHAR crs) — unary CRS extractor (ST_CRS / ST_SRID crs form).
+    register_sedona_blob_crs!("sedona_st_crs_crs", "st_crs");
 
     Ok(())
 }

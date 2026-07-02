@@ -687,6 +687,35 @@ pub fn blob_double2_to_blob(name: &'static str, input: duckdb_data_chunk, output
     }
 }
 
+/// `(geom, DOUBLE×6) → geom` (`ST_Affine` 2D: a,b,d,e,xOff,yOff).
+pub fn blob_double6_to_blob(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let geom = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let nrows = geom.row_count();
+    let arg0 = ColumnarValue::Array(Arc::new(read_blob_array(&geom, nrows)));
+    let mut args = vec![arg0];
+    let mut stypes = vec![wkb_geometry()];
+    for col in 1..=6 {
+        let reader = unsafe { VectorReader::new(chunk.as_raw(), col) };
+        let arr = Arc::new(read_f64_array(&reader, nrows));
+        let cv = match f64_scalar(&arr) {
+            Some(s) => ColumnarValue::Scalar(s),
+            None => ColumnarValue::Array(arr),
+        };
+        args.push(cv);
+        stypes.push(SedonaType::Arrow(DataType::Float64));
+    }
+    let udf = try_udf(name);
+    let out = invoke(udf, args, &stypes, nrows);
+    let mut writer = unsafe { VectorWriter::new(output) };
+    match out {
+        Some(cv) => write_back(cv, &mut writer, nrows),
+        None => for row in 0..nrows {
+            unsafe { writer.set_null(row) };
+        },
+    }
+}
+
 /// `(geom, geom) → geom` (`ST_MakeLine`).
 pub fn blob_blob_to_blob(name: &'static str, input: duckdb_data_chunk, output: duckdb_vector) {
     let chunk = unsafe { DataChunk::from_raw(input) };

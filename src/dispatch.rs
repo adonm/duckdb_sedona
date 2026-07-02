@@ -179,6 +179,27 @@ where
     }
 }
 
+/// Vectorized executor for raw-WKB functions (`Fn(&[u8]) -> Option<Vec<u8>>`).
+/// Used by the GEOS backend (`ST_Node`, `ST_Polygonize`, ...) which reads and
+/// writes ISO WKB directly without a `geo_types` round-trip.
+pub fn unary_wkb<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)
+where
+    F: Fn(&[u8]) -> Option<Vec<u8>>,
+{
+    let chunk = unsafe { DataChunk::from_raw(input) };
+    let reader = unsafe { VectorReader::new(chunk.as_raw(), 0) };
+    let mut writer = unsafe { VectorWriter::new(output) };
+    for row in 0..reader.row_count() {
+        match read_blob(&reader, row) {
+            Some(wkb) => match f(wkb) {
+                Some(out) => unsafe { writer.write_blob(row, &out) },
+                None => unsafe { writer.set_null(row) },
+            },
+            None => unsafe { writer.set_null(row) },
+        }
+    }
+}
+
 /// Vectorized executor for binary geometry-producing functions
 /// (`ST_Intersection`, `ST_Union`, ...).
 pub fn binary_geom<F>(input: duckdb_data_chunk, output: duckdb_vector, f: F)

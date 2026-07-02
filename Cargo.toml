@@ -63,6 +63,16 @@ arrow-schema = "57"
 parquet = "57"
 gdal = { version = "0.19", features = ["bindgen"] }
 
+# GEOS bindings for high-fidelity planar topology (ST_Node, ST_Polygonize,
+# ST_VoronoiPolygons) — the same engine PostGIS uses for these operations.
+# Links libgeos_c (already present transitively via GDAL). geos-sys finds it
+# via pkg-config at build time.
+geos = { version = "11.1", features = ["v3_8_0"] }
+
+# Karney-quality spheroid geodesics (ST_DistanceSpheroid, ST_LengthSpheroid).
+# Converges everywhere including antipodal points (better than Vincenty).
+geographiclib-rs = "0.2"
+
 # The *literal* SedonaDB superset. We link the real `sedona-functions` crate —
 # its `default_function_set()` of DataFusion scalar UDFs — and bridge DuckDB
 # chunks ⇄ Arrow (see `src/bridge.rs`) so DuckDB invokes SedonaDB's own kernels
